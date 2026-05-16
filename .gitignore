@@ -1,0 +1,69 @@
+# ----- Build output -----
+build/
+dist/
+dist_*/                   # any timestamped PyInstaller output dir
+*.spec.bak
+
+# ----- Compiled binaries (these are produced, never committed) -----
+*.d
+*.o
+*.obj
+*.slo
+*.lo
+*.gch
+*.pch
+*.so
+*.dylib
+*.dll
+*.lai
+*.la
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.pyd
+*.pdb
+*.exp
+*.ilk
+
+# ----- Python -----
+__pycache__/
+*.pyc
+*.pyo
+
+# ----- IDE / editor -----
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+*~
+
+# ----- Logs -----
+*.log
+
+# ----- OS junk -----
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# ----- Large test assets (keep local, distribute via Releases / external host) -----
+# .mcraw clips and rendered samples don't belong in the repo (multi-GB).
+# Drop them next to the source on disk; they're for local testing only.
+*.mcraw
+*.mp4
+*.mov
+*.exr
+bench.*
+
+# ----- Generated test outputs (from our own dev workflow) -----
+test_*.mp4
+test_*.mov
+test_*.exr
+test_exr_*/
+test_minimal*
+check_encoders.py
+motioncam_*.log
+ffmpeg_*.log

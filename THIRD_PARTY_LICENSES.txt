@@ -1,0 +1,282 @@
+================================================================================
+MCRAW Studio — Third-Party Software Notices
+================================================================================
+
+This software bundles several open-source components. Each is reproduced
+or distributed under its own license. This document lists every component,
+its copyright notice, the license it is distributed under, and where its
+source code can be obtained.
+
+The MCRAW Studio application itself is distributed under the
+Apache License, Version 2.0 — see the LICENSE file in the source tree.
+
+================================================================================
+SOURCE CODE AVAILABILITY  (GPL / LGPL compliance)
+================================================================================
+
+The full source code for MCRAW Studio, together with the build scripts
+and version information needed to reproduce the bundled binaries, is
+available at:
+
+    https://github.com/[REPLACE-WITH-YOUR-GITHUB-OWNER]/motioncam-tools
+
+This includes the source we wrote and references to the exact upstream
+versions of FFmpeg, libx264, libx265, Qt, OpenColorIO, OpenEXR and the
+other components listed below.
+
+Written offer (GPL §6 / LGPL §6 compliance):
+    For at least three years from the date you received this software,
+    you may obtain a copy of the corresponding source code for any GPL or
+    LGPL component bundled with this software, on a physical or download
+    medium of your choice, by writing to:
+
+        [REPLACE-WITH-YOUR-EMAIL-OR-POSTAL-ADDRESS]
+
+    Specify which component you want and the version (read the version
+    metadata of the bundled .exe via right-click → Properties → Details
+    if unsure). The cost charged will not exceed the cost of physically
+    performing the source distribution.
+
+================================================================================
+COMPONENT INDEX
+================================================================================
+
+  1. MotionCam decoder library  ........................  Apache 2.0
+  2. FFmpeg  ...........................................  LGPL 2.1+ / GPL 2+
+  3. libx264  ..........................................  GPL 2+
+  4. libx265  ..........................................  GPL 2+
+  5. NVIDIA Codec SDK headers (ffnvcodec)  .............  MIT
+  6. OpenColorIO  ......................................  BSD 3-Clause
+  7. OpenEXR + Imath  ..................................  BSD 3-Clause
+  8. Qt (via PySide6 / shiboken6)  .....................  LGPL 3
+  9. PySide6 / shiboken6  ..............................  LGPL 3
+ 10. pybind11  .........................................  BSD 3-Clause
+ 11. nlohmann/json  ....................................  MIT
+ 12. tinydng  ..........................................  BSD 3-Clause
+ 13. simde  ............................................  MIT
+ 14. AudioFile  ........................................  MIT
+ 15. Python  ...........................................  PSF License
+ 16. Microsoft VC++ Redistributable Runtime DLLs  ......  Microsoft EULA
+ 17. PyInstaller bootloader  ...........................  Apache 2.0
+
+================================================================================
+
+ 1. MotionCam decoder library
+    Copyright 2023 MotionCam (https://www.motioncamapp.com)
+    License: Apache License, Version 2.0
+    Source: https://github.com/mirsadm/motioncam-decoder
+    Full license text: https://www.apache.org/licenses/LICENSE-2.0
+
+ 2. FFmpeg
+    Copyright (c) 2000-2024 the FFmpeg developers and authors.
+    The bundled FFmpeg has been compiled with --enable-gpl together with
+    --enable-libx264 and --enable-libx265, which makes the combined
+    FFmpeg work as redistributed here covered by the GNU General Public
+    License, Version 2 or later (GPL-2.0-or-later).
+    Source: https://ffmpeg.org/download.html
+    Full LGPL text: https://www.gnu.org/licenses/lgpl-2.1.html
+    Full GPL  text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+    See additional FFmpeg-specific notices at: https://ffmpeg.org/legal.html
+
+ 3. libx264
+    Copyright (C) 2003-2024 x264 project — VideoLAN and authors.
+    License: GNU General Public License, Version 2 or later (GPL-2.0-or-later)
+    Source: https://www.videolan.org/developers/x264.html
+    Full GPL text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+ 4. libx265
+    Copyright (C) 2013-2024 MulticoreWare, Inc.
+    License: GNU General Public License, Version 2 or later (GPL-2.0-or-later)
+    Source: https://bitbucket.org/multicoreware/x265_git
+    Full GPL text: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+ 5. NVIDIA Codec SDK headers (ffnvcodec)
+    Copyright (c) 2010-2024 NVIDIA Corporation
+    License: MIT
+    Source: https://github.com/FFmpeg/nv-codec-headers
+
+    NOTE: Only the public NVENC/NVDEC C headers are statically referenced
+    from FFmpeg at compile time. The actual NVENC encoder runtime is
+    loaded from the user's installed NVIDIA driver at runtime and is
+    NOT redistributed by this product.
+
+ 6. OpenColorIO
+    Copyright Contributors to the OpenColorIO Project.
+    License: BSD 3-Clause
+    Source: https://github.com/AcademySoftwareFoundation/OpenColorIO
+
+    This product also includes the built-in studio configuration
+    "studio-config-v4.0.0_aces-v2.0_ocio-v2.5", distributed as part of
+    OpenColorIO under the same BSD 3-Clause license.
+
+ 7. OpenEXR and Imath
+    Copyright Contributors to the OpenEXR Project.
+    License: BSD 3-Clause
+    Source: https://github.com/AcademySoftwareFoundation/openexr
+            https://github.com/AcademySoftwareFoundation/Imath
+
+ 8. Qt (bundled via PySide6)
+    The Qt Company Ltd. and contributors.
+    License: GNU Lesser General Public License, Version 3 (LGPL-3.0)
+    Source: https://download.qt.io/official_releases/qt/
+    Full LGPL text: https://www.gnu.org/licenses/lgpl-3.0.html
+
+    Qt is dynamically linked into this product through PyInstaller's
+    onefile bundle. In accordance with the LGPL, the Qt DLLs can be
+    extracted from the bundle and replaced with user-built Qt DLLs of
+    the same version; see https://pyinstaller.org/ for the bundle's
+    extraction mechanism.
+
+ 9. PySide6 and shiboken6
+    Copyright (C) 2024 The Qt Company Ltd.
+    License: GNU Lesser General Public License, Version 3 (LGPL-3.0)
+    Source: https://download.qt.io/official_releases/QtForPython/
+
+10. pybind11
+    Copyright (c) 2016 Wenzel Jakob and contributors.
+    License: BSD 3-Clause-style (custom; see project)
+    Source: https://github.com/pybind/pybind11
+
+11. nlohmann/json
+    Copyright (c) 2013-2022 Niels Lohmann.
+    License: MIT
+    Source: https://github.com/nlohmann/json
+
+12. tinydng (single-header DNG writer)
+    Copyright (c) 2017-2023 Syoyo Fujita and contributors.
+    License: BSD 3-Clause (same terms as TinyEXR)
+    Source: https://github.com/syoyo/tinydng
+    Vendored under thirdparty/tinydng in the source tree.
+
+13. simde (SIMD Everywhere)
+    Copyright (c) 2017-2024 simde contributors.
+    License: MIT
+    Source: https://github.com/simd-everywhere/simde
+    Vendored under thirdparty/simde in the source tree.
+
+14. AudioFile
+    Copyright (c) 2017-2024 Adam Stark.
+    License: MIT
+    Source: https://github.com/adamstark/AudioFile
+    Vendored under thirdparty/audiofile in the source tree.
+
+15. Python
+    Copyright (c) 2001-2024 Python Software Foundation.
+    Copyright (c) 2000 BeOpen.com.
+    Copyright (c) 1995-2001 Corporation for National Research Initiatives.
+    Copyright (c) 1991-1995 Stichting Mathematisch Centrum.
+    License: PSF License Agreement (a permissive BSD-style license)
+    Source: https://www.python.org/downloads/
+    Full text: https://docs.python.org/3/license.html
+
+16. Microsoft Visual C++ Redistributable Runtime DLLs
+    (vcruntime140.dll, vcruntime140_1.dll, vcruntime140_threads.dll,
+     msvcp140.dll, msvcp140_1.dll, msvcp140_2.dll,
+     msvcp140_atomic_wait.dll, msvcp140_codecvt_ids.dll, ucrtbase.dll
+     and the api-ms-win-* shim DLLs)
+    Copyright (c) Microsoft Corporation.
+    License: Microsoft Software License Terms — Visual Studio
+            Distributable Code. These files are listed by Microsoft as
+            "REDIST.txt" runtime files, redistributable as part of
+            applications built with Microsoft Visual Studio.
+    See: https://visualstudio.microsoft.com/license-terms/
+
+17. PyInstaller bootloader
+    Copyright (c) 2005-2024 PyInstaller Development Team.
+    License: Apache License, Version 2.0 (since PyInstaller 6.0; the
+            previous "GPL with bootloader exception" no longer applies).
+    Source: https://github.com/pyinstaller/pyinstaller
+    Full license text: https://www.apache.org/licenses/LICENSE-2.0
+
+================================================================================
+SHORT-LICENSE TEXTS  (for components above whose licenses are inline)
+================================================================================
+
+--------------------------------------------------------------------------------
+MIT License  (covers items 5, 11, 13, 14)
+--------------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
+THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------------
+BSD 3-Clause License  (covers items 6, 7, 10, 12)
+--------------------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+ 1. Redistributions of source code must retain the above copyright notice,
+    this list of conditions and the following disclaimer.
+
+ 2. Redistributions in binary form must reproduce the above copyright
+    notice, this list of conditions and the following disclaimer in the
+    documentation and/or other materials provided with the distribution.
+
+ 3. Neither the name of the copyright holder nor the names of its
+    contributors may be used to endorse or promote products derived from
+    this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF
+THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+LONG-LICENSE TEXTS
+================================================================================
+
+The following components carry licenses too long to embed inline. Their
+canonical full texts are referenced by URL above and are also included
+verbatim in their respective project source distributions, which can be
+fetched from the URLs given in each component's entry, or via the written
+offer at the top of this document.
+
+  - GNU General Public License, Version 2  (libx264, libx265, FFmpeg
+    when GPL-enabled)
+        https://www.gnu.org/licenses/old-licenses/gpl-2.0.txt
+
+  - GNU Lesser General Public License, Version 2.1  (FFmpeg core)
+        https://www.gnu.org/licenses/old-licenses/lgpl-2.1.txt
+
+  - GNU General Public License, Version 3  (referenced by LGPL 3)
+        https://www.gnu.org/licenses/gpl-3.0.txt
+
+  - GNU Lesser General Public License, Version 3  (Qt, PySide6)
+        https://www.gnu.org/licenses/lgpl-3.0.txt
+
+  - Apache License, Version 2.0  (MotionCam decoder, this product,
+    PyInstaller bootloader)
+        https://www.apache.org/licenses/LICENSE-2.0.txt
+
+  - Python Software Foundation License Agreement (Python)
+        https://docs.python.org/3/license.html
+
+We are happy to ship a copy of any of the above license texts on request
+via the written offer at the top of this document.
+
+================================================================================
+END OF NOTICES
+================================================================================

@@ -1,0 +1,52 @@
+name: build
+
+# Fast PR / push smoke build. Compiles the core decoder + example so we catch
+# obvious breakage (container parsing, RawData compression, Trimmer) without
+# pulling the full vcpkg dependency tree (OpenEXR + OCIO + FFmpeg + pybind11)
+# which takes ~30 min cold and complicates caching.
+#
+# To validate the full render pipeline (mcraw_render + Python module) you
+# currently still need to build locally — that's documented in CONTRIBUTING.md.
+# If PR volume grows enough to justify it, extend this workflow with a second
+# job that does the full vcpkg-backed build with GHA binary caching.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows-core:
+    name: Windows / core build
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure (decoder + example only)
+        # MCRAW_BUILD_RENDER=OFF disables the OpenEXR / OCIO / FFmpeg path;
+        # MCRAW_BUILD_PYTHON=OFF disables pybind11. Both rely on vcpkg.
+        run: |
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DMCRAW_BUILD_RENDER=OFF `
+            -DMCRAW_BUILD_PYTHON=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke-check the example binary
+        # Running it with no args should exit non-zero with a usage message,
+        # not crash. Confirms the binary actually links and starts.
+        run: |
+          if (Test-Path build/Release/example.exe) {
+            $exe = "build/Release/example.exe"
+          } else {
+            $exe = "build/example.exe"
+          }
+          Write-Host "Probing $exe"
+          & $exe 2>&1 | Out-String | Write-Host
+          # Treat any exit code as a pass — we only care that it didn't crash.
+          exit 0

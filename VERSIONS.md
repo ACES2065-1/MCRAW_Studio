@@ -1,0 +1,39 @@
+# MCRAW Studio — release verification
+
+Each row is a published `MCRAWStudio.exe`. Use the SHA-256 to verify your
+download came from this repository and hasn't been tampered with.
+
+## How to verify
+
+**Windows PowerShell**
+
+```powershell
+Get-FileHash -Algorithm SHA256 .\MCRAWStudio.exe
+```
+
+**Windows Command Prompt**
+
+```cmd
+certutil -hashfile MCRAWStudio.exe SHA256
+```
+
+The reported hash must match the row below for your version *exactly* (case
+doesn't matter). If it doesn't, **don't run the file** — re-download from
+the GitHub Release linked here, not from a third-party mirror.
+
+## Releases
+
+| Version | Date       | Size       | SHA-256                                                            | Release |
+|---------|------------|------------|--------------------------------------------------------------------|---------|
+| 0.1.0   | 2026-05-16 | 64,343,502 | `E121DA30AC6E22611637E39F8C9E692487597BE1ED95712093496B694C9F43E5` | [v0.1.0](https://github.com/outoftokyo/MCRAW_Studio/releases/tag/v0.1.0) |
+
+<!--
+When cutting a new release:
+  1. Build the .exe (PyInstaller).
+  2. Get-FileHash -Algorithm SHA256 .\dist\MCRAWStudio.exe
+  3. Tag a release on GitHub (e.g. v0.2.0) and attach BOTH:
+       - MCRAWStudio.exe
+       - MCRAWStudio.exe.sha256   (a one-line text file with the hash)
+  4. Add a row to the table above with the date, size, hash, and release link.
+  5. Commit + push.
+-->
