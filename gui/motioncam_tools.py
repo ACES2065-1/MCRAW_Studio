@@ -1650,8 +1650,8 @@ APP_VERSION = "0.1.0"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"
-REPORT_URL  = "https://github.com/outoftokyo/MCRAW_Studio"
-PROJECT_URL = "https://github.com/outoftokyo/MCRAW_Studio"
+REPORT_URL  = "https://github.com/ACES2065-1/MCRAW_Studio"
+PROJECT_URL = "https://github.com/ACES2065-1/MCRAW_Studio"
 
 # ----- Crash + render logging ------------------------------------------------
 # All logging goes to a single file at:
