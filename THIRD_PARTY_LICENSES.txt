@@ -18,7 +18,7 @@ The full source code for MCRAW Studio, together with the build scripts
 and version information needed to reproduce the bundled binaries, is
 available at:
 
-    https://github.com/[REPLACE-WITH-YOUR-GITHUB-OWNER]/motioncam-tools
+    https://github.com/ACES2065-1/MCRAW_Studio
 
 This includes the source we wrote and references to the exact upstream
 versions of FFmpeg, libx264, libx265, Qt, OpenColorIO, OpenEXR and the
@@ -30,7 +30,7 @@ Written offer (GPL §6 / LGPL §6 compliance):
     LGPL component bundled with this software, on a physical or download
     medium of your choice, by writing to:
 
-        [REPLACE-WITH-YOUR-EMAIL-OR-POSTAL-ADDRESS]
+        ayoubafiniss@gmail.com
 
     Specify which component you want and the version (read the version
     metadata of the bundled .exe via right-click → Properties → Details

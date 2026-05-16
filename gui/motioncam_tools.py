@@ -1,6 +1,6 @@
 """MCRAW Studio — drag-and-drop bulk MCRAW transcoder.
 
-Made by KIRA. Apache 2.0.
+Made by ACES2065-1. Apache 2.0.
 """
 from __future__ import annotations
 
@@ -774,7 +774,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _show_about(self) -> None:
         text = f"""\
 <h3>MCRAW Studio</h3>
-<p><b>Version:</b> {APP_VERSION} &nbsp;·&nbsp; <b>made by KIRA</b></p>
+<p><b>Version:</b> {APP_VERSION} &nbsp;·&nbsp; <b>made by ACES2065-1</b></p>
 <p><a href="{PROJECT_URL}">{PROJECT_URL}</a></p>
 """
         box = QtWidgets.QMessageBox(self)
@@ -1650,8 +1650,8 @@ APP_VERSION = "0.1.0"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"
-REPORT_URL  = "https://github.com/outoftokyo/MCRAW_Studio"
-PROJECT_URL = "https://github.com/outoftokyo/MCRAW_Studio"
+REPORT_URL  = "https://github.com/ACES2065-1/MCRAW_Studio"
+PROJECT_URL = "https://github.com/ACES2065-1/MCRAW_Studio"
 
 # ----- Crash + render logging ------------------------------------------------
 # All logging goes to a single file at:
@@ -1774,7 +1774,7 @@ def main() -> int:
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("MCRAW Studio")
     app.setApplicationVersion(APP_VERSION)
-    app.setOrganizationName("KIRA")
+    app.setOrganizationName("ACES2065-1")
 
     icon_path = _resource_path("icon.png")
     if icon_path is not None:

@@ -1,6 +1,6 @@
 # MCRAW Studio
 
-*by **KIRA***
+*by **ACES2065-1***
 
 A bulk transcoder for [MotionCam Pro](https://www.motioncamapp.com/) `.mcraw`
 files, with an ACES-aware color pipeline. Drag clips in, pick a delivery

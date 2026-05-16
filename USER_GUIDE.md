@@ -1,6 +1,6 @@
 # MCRAW Studio — what it does
 
-*by **KIRA***
+*by **ACES2065-1***
 
 A single Windows app for converting MotionCam Pro `.mcraw` recordings into
 the format you actually need. Drag clips in, pick where they should go, hit

@@ -8,7 +8,7 @@ If you're just here to **report a bug** or **request a feature**, jump straight 
 
 ## Bug reports
 
-Open an issue at [github.com/outoftokyo/MCRAW_Studio/issues](https://github.com/outoftokyo/MCRAW_Studio/issues) with:
+Open an issue at [github.com/ACES2065-1/MCRAW_Studio/issues](https://github.com/ACES2065-1/MCRAW_Studio/issues) with:
 
 1. Your **Windows version** (Win10 / Win11, x64 build number) and **MotionCam app version** that recorded the clip.
 2. The **render settings** you used (format, codec, colour space, transfer, recover highlights on/off).
@@ -21,7 +21,7 @@ A bug report without the log file is much harder to act on. Please attach it.
 
 ## Feature requests
 
-Same place: [issues](https://github.com/outoftokyo/MCRAW_Studio/issues). Helpful framing:
+Same place: [issues](https://github.com/ACES2065-1/MCRAW_Studio/issues). Helpful framing:
 
 - **What** you want to do
 - **Why** the current flow doesn't work for you
@@ -247,4 +247,4 @@ The bundled `MCRAWStudio.exe` is GPL-2.0+ because it statically links FFmpeg wit
 
 Open an issue or ping in the discussion threads. Discord coming soon.
 
-— KIRA
+— ACES2065-1

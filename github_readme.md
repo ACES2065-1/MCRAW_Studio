@@ -17,7 +17,7 @@ A Windows desktop transcoder for `.mcraw` footage. True ACES colour pipeline, al
 
 - Single 62 MB Windows .exe. No installer, no admin, no service.
 - Win 10 / 11 x64.
-- Every release is published with a SHA-256 — verify against [VERSIONS.md](VERSIONS.md) or the matching [GitHub Release](https://github.com/outoftokyo/MCRAW_Studio/releases) before running.
+- Every release is published with a SHA-256 — verify against [VERSIONS.md](VERSIONS.md) or the matching [GitHub Release](https://github.com/ACES2065-1/MCRAW_Studio/releases) before running.
 
 ## Free + tip jar
 
@@ -25,7 +25,7 @@ No paywall, no nag screens. If it saved you a session, drop a tip — it funds r
 
 [**Tip →**](https://afnisse-shop.fourthwall.com/products/mcraw-studio)
 
-Bugs / requests: [github.com/outoftokyo](https://github.com/outoftokyo)
+Bugs / requests: [github.com/ACES2065-1/MCRAW_Studio](https://github.com/ACES2065-1/MCRAW_Studio)
 Discord coming soon.
 
-— **KIRA**
+— **ACES2065-1**
