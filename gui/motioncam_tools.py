@@ -16,9 +16,30 @@ from pathlib import Path
 
 
 def _setup_paths() -> None:
-    """Ensure mcraw.pyd and its native deps resolve when running from source."""
+    """Ensure mcraw.pyd and its native deps resolve.
+
+    Frozen (PyInstaller) bundles: vcpkg DLLs are extracted to
+    `_MEIPASS\\ffmpeg_runtime\\` (see motioncam_tools.spec). Register that
+    subdirectory with os.add_dll_directory() so the Windows loader resolves
+    mcraw.pyd's implicit imports (avcodec / swscale / x265 / OpenColorIO /
+    etc.) from our bundled copy. Because Python's import machinery calls
+    LoadLibraryExW with LOAD_LIBRARY_SEARCH_USER_DIRS, our subdirectory is
+    consulted BEFORE the user's PATH — so a separately installed ffmpeg in
+    PATH can no longer shadow ours and trigger ABI-mismatch failures
+    (ENOMEM at avcodec_open2, "external library error" on send_frame,
+    etc.). Achieves the same protection as SetDefaultDllDirectories but
+    without importing ctypes (which collides with vcpkg's ffi-8.dll in
+    the bundle).
+
+    Dev-from-source: load mcraw.pyd from `build/` and pull vcpkg DLLs
+    from the local install. Unchanged behaviour.
+    """
     if getattr(sys, "frozen", False):
-        return  # PyInstaller bundle takes care of this
+        if hasattr(os, "add_dll_directory"):
+            runtime = Path(sys._MEIPASS) / "ffmpeg_runtime"
+            if runtime.is_dir():
+                os.add_dll_directory(str(runtime))
+        return
     here = Path(__file__).resolve().parent
     project_root = here.parent
     build_dir = project_root / "build"
@@ -55,6 +76,150 @@ def _safe_unhandled(exc_type, exc_value, _exc_tb) -> str:
     sys.excepthook / threading.excepthook hand us. Discards `_exc_tb`."""
     name = getattr(exc_type, "__name__", "Exception")
     return f"{name}: {exc_value}"
+
+
+# ----- Diagnostic host probes -------------------------------------------------
+# All probes deliberately avoid `import ctypes`. Python's ctypes pulls
+# `_ctypes.pyd` and `libffi-8.dll` into the PyInstaller bundle, which
+# collides at runtime with vcpkg's `ffi-8.dll` (also bundled by the spec's
+# vcpkg/bin glob) and segfaults the process before any logging starts.
+# PowerShell + subprocess gets us the same diagnostic data without that
+# bundling side-effect.
+
+def _run_subprocess_quiet(args, timeout):
+    try:
+        import subprocess
+        flags = 0
+        if sys.platform == "win32":
+            flags = 0x08000000  # CREATE_NO_WINDOW
+        return subprocess.run(
+            args, capture_output=True, text=True, timeout=timeout,
+            creationflags=flags,
+        )
+    except Exception:
+        return None
+
+
+def _ram_status_gb():
+    """(total_gb, available_gb, percent_used) via PowerShell. Never raises."""
+    if sys.platform != "win32":
+        return None
+    ps = (
+        "$os = Get-CimInstance Win32_OperatingSystem;"
+        " '{0}|{1}' -f $os.TotalVisibleMemorySize, $os.FreePhysicalMemory"
+    )
+    cp = _run_subprocess_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+        timeout=8.0,
+    )
+    if cp is None or cp.returncode != 0:
+        return None
+    try:
+        parts = cp.stdout.strip().split("|")
+        if len(parts) != 2:
+            return None
+        total_kb = int(parts[0])
+        free_kb = int(parts[1])
+        total_gb = total_kb / (1024 * 1024)
+        avail_gb = free_kb / (1024 * 1024)
+        pct = int(round((1.0 - free_kb / total_kb) * 100)) if total_kb else 0
+        return (total_gb, avail_gb, pct)
+    except Exception:
+        return None
+
+
+def _log_gpu_info():
+    """Enumerate GPUs. nvidia-smi first (accurate VRAM); WMI fallback."""
+    if sys.platform != "win32":
+        log.info("GPU enumeration: skipped (non-Windows host)")
+        return
+    import shutil
+    logged_any = False
+    nvsmi = shutil.which("nvidia-smi")
+    if nvsmi:
+        cp = _run_subprocess_quiet(
+            [nvsmi,
+             "--query-gpu=name,memory.total,memory.free,driver_version",
+             "--format=csv,noheader,nounits"],
+            timeout=5.0,
+        )
+        if cp is not None and cp.returncode == 0:
+            for line in cp.stdout.strip().splitlines():
+                parts = [p.strip() for p in line.split(",")]
+                if len(parts) >= 4:
+                    name, vram_mb, free_mb, drv = parts[:4]
+                    log.info(
+                        "GPU [NVIDIA]: %s - VRAM %s MB (%s MB free), driver %s",
+                        name, vram_mb, free_mb, drv,
+                    )
+                    logged_any = True
+    ps_cmd = (
+        "Get-CimInstance Win32_VideoController | "
+        "ForEach-Object { '{0}|{1}|{2}' -f $_.Name, $_.AdapterRAM, $_.DriverVersion }"
+    )
+    cp = _run_subprocess_quiet(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+        timeout=10.0,
+    )
+    if cp is not None and cp.returncode == 0:
+        for line in cp.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) < 3 or not parts[0].strip():
+                continue
+            name = parts[0].strip()
+            ram_raw = parts[1].strip()
+            drv = parts[2].strip() or "unknown"
+            try:
+                ram_bytes = int(ram_raw) if ram_raw else 0
+            except ValueError:
+                ram_bytes = 0
+            ram_mb = ram_bytes // (1024 * 1024)
+            if ram_mb <= 0:
+                vram_str = "unknown"
+            elif ram_mb >= 4090:
+                vram_str = f"~{ram_mb} MB (WMI uint32 cap)"
+            else:
+                vram_str = f"{ram_mb} MB"
+            log.info("GPU [WMI]: %s - VRAM %s, driver %s", name, vram_str, drv)
+            logged_any = True
+    if not logged_any:
+        log.info("GPU: no adapters enumerated")
+
+
+def _log_host_info():
+    """Log CPU + RAM + GPU at startup. Cheap (~1-2s for PowerShell calls)."""
+    try:
+        cpu_name = (platform.processor() or "").strip() or "unknown"
+        log.info("CPU: %s (%d logical cores)", cpu_name, os.cpu_count() or 0)
+    except Exception as exc:
+        log.info("CPU probe failed: %s", _safe_error(exc))
+    ram = _ram_status_gb()
+    if ram is not None:
+        log.info("RAM: %.1f GB total, %.1f GB available (%d%% used)",
+                 ram[0], ram[1], ram[2])
+    else:
+        log.info("RAM: probe unavailable")
+    _log_gpu_info()
+
+
+def _probe_input_resolution(path):
+    """Return 'WxH' for an .mcraw input, or a short reason on failure.
+    Tries container_metadata first (free); falls back to decoding one
+    frame (~200ms on a 4K MCRAW). Never raises."""
+    try:
+        d = mcraw.Decoder(path)
+        meta = d.container_metadata or {}
+        w = meta.get("width") if isinstance(meta, dict) else None
+        h = meta.get("height") if isinstance(meta, dict) else None
+        if isinstance(w, int) and isinstance(h, int) and w > 0 and h > 0:
+            return f"{w}x{h}"
+        ts = d.frames
+        if ts:
+            _, fh, fw = d.process_frame_rgb24(ts[0], "srgb")
+            return f"{fw}x{fh}"
+        return "no-frames"
+    except Exception as exc:
+        return f"probe-failed:{type(exc).__name__}"
 
 
 # ----- Color space lookup ----------------------------------------------------
@@ -201,8 +366,12 @@ class RenderWorker(QtCore.QObject):
 
         # Log a sanitised view of the settings (no callable progress arg).
         safe_settings = {k: v for k, v in self.settings.items() if k != "progress"}
-        log.info("Render START  in=%s  out=%s  range=[%d..%d]  settings=%s",
-                 inp, outp, start, end, safe_settings)
+        res_str = _probe_input_resolution(inp)
+        ram = _ram_status_gb()
+        ram_str = (f"{ram[1]:.1f}/{ram[0]:.1f} GB free"
+                   if ram is not None else "n/a")
+        log.info("Render START  in=%s  out=%s  range=[%d..%d]  res=%s  ram=%s  settings=%s",
+                 inp, outp, start, end, res_str, ram_str, safe_settings)
         t_start = time.time()
 
         # MCRAW trim: bypass the color/encode pipeline entirely.
@@ -314,6 +483,9 @@ class ThumbWorker(QtCore.QObject):
             target=self._work, args=(path, frame_idx), daemon=True
         ).start()
 
+    _PREVIEW_MAX_W = 1920
+    _PREVIEW_MAX_H = 1080
+
     def _work(self, path: str, frame_idx: int) -> None:
         try:
             d = mcraw.Decoder(path)
@@ -322,7 +494,15 @@ class ThumbWorker(QtCore.QObject):
                 return
             # numpy-free path: C++ side returns RGB888 packed bytes directly.
             buf, h, w = d.process_frame_rgb24(timestamps[frame_idx], "srgb")
-            img = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
+            full = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
+            if w > self._PREVIEW_MAX_W or h > self._PREVIEW_MAX_H:
+                img = full.scaled(
+                    self._PREVIEW_MAX_W, self._PREVIEW_MAX_H,
+                    QtCore.Qt.KeepAspectRatio,
+                    QtCore.Qt.SmoothTransformation,
+                )
+            else:
+                img = full.copy()
             self.done.emit(path, frame_idx, img)
         except Exception as exc:
             print(f"[thumb] decode failed for {Path(path).name} frame {frame_idx}: {exc}")
@@ -1646,7 +1826,7 @@ def _load_stylesheet() -> str:
         return ""
 
 
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"
@@ -1722,6 +1902,12 @@ def _setup_logging() -> None:
         log.info("NVENC available: H.264=%s H.265=%s AV1=%s", nv264, nv265, nvav1)
     except Exception as exc:
         log.info("NVENC probe failed: %s", exc)
+    # Diagnostic host probes are best-effort — never block app startup if
+    # they fail (e.g. PowerShell unreachable, WMI restricted, etc.).
+    try:
+        _log_host_info()
+    except Exception as exc:
+        log.info("host probes failed: %s", _safe_error(exc))
 
 
 def _install_excepthooks() -> None:
