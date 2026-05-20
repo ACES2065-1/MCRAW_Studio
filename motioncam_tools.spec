@@ -27,12 +27,24 @@ VCPKG_INSTALL_DIR = Path(os.environ.get(
     r"C:\dev\vcpkg\installed\x64-windows"))
 VCPKG_BIN = VCPKG_INSTALL_DIR / "bin"
 
-# Bundle every DLL from vcpkg's bin dir — easier than tracking the transitive
-# deps of avcodec / OpenEXR / OpenColorIO by hand. Drops the .pyd alongside.
+# Bundle every DLL from vcpkg's bin dir into a private "ffmpeg_runtime"
+# subdirectory of the PyInstaller extraction tree, NOT the bundle root. The
+# Python side registers that subdir via os.add_dll_directory() before
+# `import mcraw`, so mcraw.pyd's implicit DLL imports (avcodec / swscale /
+# x265 / OpenColorIO / etc.) resolve from our copy instead of any ffmpeg a
+# user happens to have on their PATH. Without this isolation, an installed
+# ffmpeg in PATH can shadow our bundled DLLs by name, leading to ABI
+# mismatches that surface as ENOMEM / "external library error" / mid-encode
+# allocator failures.
 binaries = []
 for dll in VCPKG_BIN.glob("*.dll"):
-    binaries.append((str(dll), "."))
+    binaries.append((str(dll), "ffmpeg_runtime"))
 
+# mcraw.pyd stays in the bundle root so Python's standard import machinery
+# can find it via sys.path. Its implicit ffmpeg dependencies are resolved
+# via the USER_DIRS list (populated by os.add_dll_directory in
+# _setup_paths), which Python passes to LoadLibraryExW for extension
+# module loads.
 mcraw_pyd = BUILD_DIR / "mcraw.cp312-win_amd64.pyd"
 if mcraw_pyd.exists():
     binaries.append((str(mcraw_pyd), "."))
