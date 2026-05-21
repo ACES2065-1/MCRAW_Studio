@@ -60,6 +60,14 @@ void BuildCameraToAcescg(const float forwardMatrixD50[9], float out[9]) {
 }
 
 void ApplyMatrixInPlace(float* rgb, size_t numPixels, const float M[9]) {
+    // NOTE: the AoS interleaved-RGB layout means an explicit AVX2 path here
+    // pays 9 vpermps + 4 vblendps for the deinterleave + reinterleave per
+    // 8-pixel batch, which on Skylake / Zen-class cores costs roughly as
+    // much as the 9 FMAs it saves. We benchmarked the explicit SIMD version
+    // and it came out flat-to-slightly-worse against /arch:AVX2 scalar code
+    // (the auto-vectorizer + FMA contraction does fine here). Keeping the
+    // simple scalar loop — when we eventually move to a planar RGB layout
+    // through the pipeline, this kernel becomes trivially SIMD-friendly.
     motioncam::internal::ParallelForRange(numPixels, [&](size_t i0, size_t i1) {
         for (size_t i = i0; i < i1; ++i) {
             const float r = rgb[i*3 + 0];

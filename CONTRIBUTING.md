@@ -38,6 +38,7 @@ The roadmap is in the README. Anything not on it is fair game to suggest.
 | | Tested version | Notes |
 |---|---|---|
 | OS | Windows 10 / 11 x64 | Linux / macOS not currently supported |
+| CPU | x86-64 with **AVX2** | Intel Haswell (2013) / AMD Excavator (2015) or newer. The build uses `/arch:AVX2`. |
 | Compiler | **MSVC** (VS 2022 Community / Pro / Enterprise, or VS 18 Insiders) | "Desktop development with C++" workload |
 | Build tools | CMake 3.15+ and Ninja | Either install standalone or rely on vcpkg's bundled copies |
 | Package manager | [vcpkg](https://github.com/microsoft/vcpkg) | Default location: `C:\dev\vcpkg`. Override via `VCPKG_ROOT` env var |
