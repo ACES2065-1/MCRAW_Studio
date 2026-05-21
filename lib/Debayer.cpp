@@ -50,23 +50,46 @@ void NormalizeBayer(
 
     const float invWb[3] = { 1.0f / wb[0], 1.0f / wb[1], 1.0f / wb[2] };
 
-    float invRange[4];
-    float wbMul[4];
+    // Precompute per-CFA-position constants: blackF[i] for subtraction, and
+    // scale[i] = invRange * wbMul collapses two pre-pixel multiplies into
+    // one. Trivially auto-vectorisable straight-line per-row loop once we
+    // pull the CFA-position branch out into per-row constants.
+    float blackF[4];
+    float scale[4];
     for (int i = 0; i < 4; ++i) {
         double denom = whiteLevel - double(black[i]);
-        invRange[i] = denom > 0.0 ? float(1.0 / denom) : 0.0f;
-        wbMul[i] = invWb[ch[i]];
+        float invRange = denom > 0.0 ? float(1.0 / denom) : 0.0f;
+        blackF[i] = float(black[i]);
+        scale[i]  = invRange * invWb[ch[i]];
     }
 
     motioncam::internal::ParallelForRange(height, [&](size_t y0, size_t y1) {
         for (size_t y = y0; y < y1; ++y) {
             const size_t row = y * size_t(width);
             const int yParity = int(y & 1u) << 1;
-            for (uint32_t x = 0; x < width; ++x) {
+            const float b_even = blackF[yParity | 0];
+            const float b_odd  = blackF[yParity | 1];
+            const float s_even = scale [yParity | 0];
+            const float s_odd  = scale [yParity | 1];
+
+            // Process pixel pairs so each iteration has fully resolved
+            // constants — the compiler unrolls + vectorises this with
+            // /arch:AVX2 / /fp:fast on MSVC and -O3 -mavx2 -mfma on Clang.
+            uint32_t x = 0;
+            for (; x + 1 < width; x += 2) {
+                float v_even = float(raw[row + x    ]) - b_even;
+                float v_odd  = float(raw[row + x + 1]) - b_odd;
+                if (v_even < 0.0f) v_even = 0.0f;
+                if (v_odd  < 0.0f) v_odd  = 0.0f;
+                out[row + x    ] = v_even * s_even;
+                out[row + x + 1] = v_odd  * s_odd;
+            }
+            // Width was odd — handle the trailing column (rare).
+            if (x < width) {
                 const int idx = yParity | int(x & 1u);
-                int32_t v = int32_t(raw[row + x]) - int32_t(black[idx]);
-                if (v < 0) v = 0;
-                out[row + x] = float(v) * invRange[idx] * wbMul[idx];
+                float v = float(raw[row + x]) - blackF[idx];
+                if (v < 0.0f) v = 0.0f;
+                out[row + x] = v * scale[idx];
             }
         }
     });

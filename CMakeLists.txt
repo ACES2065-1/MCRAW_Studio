@@ -71,19 +71,35 @@ if (MCRAW_BUILD_RENDER)
             ${FFMPEG_LIBRARIES}
     )
 
+    # /arch:AVX2 — lets the auto-vectorizer emit 256-bit SIMD and unlocks
+    # AVX2 intrinsics in hand-written kernels (Debayer, ColorPipeline). AVX2
+    # has been mainstream since Intel Haswell (2013) and AMD Excavator/Ryzen
+    # (2015-2017); any 4K-video-capable Windows machine has it. We do a
+    # runtime CPU-feature check at app startup (see RequireAvx2) and abort
+    # with a clear message if a user has a pre-AVX2 CPU.
+    #
+    # /fp:fast — lets the compiler reassociate float operations
+    # (a + b + c → (a + c) + b) which is needed for the auto-vectorizer to
+    # turn reduction loops into SIMD. Our colour math doesn't depend on
+    # bit-exact float ordering — we work in float32 throughout and the
+    # output goes through codecs that quantize anyway.
     if (MSVC)
-        target_compile_options(mcraw_color PRIVATE /utf-8 /W4)
+        target_compile_options(mcraw_color PRIVATE
+            /utf-8 /W4 /arch:AVX2 /fp:fast)
     else()
-        target_compile_options(mcraw_color PRIVATE -Wall -O3)
+        target_compile_options(mcraw_color PRIVATE
+            -Wall -O3 -mavx2 -mfma -ffast-math)
     endif()
 
     add_executable(mcraw_render mcraw_render.cpp)
     target_link_libraries(mcraw_render PRIVATE mcraw_color)
 
     if (MSVC)
-        target_compile_options(mcraw_render PRIVATE /utf-8 /W4)
+        target_compile_options(mcraw_render PRIVATE
+            /utf-8 /W4 /arch:AVX2 /fp:fast)
     else()
-        target_compile_options(mcraw_render PRIVATE -Wall -O3)
+        target_compile_options(mcraw_render PRIVATE
+            -Wall -O3 -mavx2 -mfma -ffast-math)
     endif()
 endif()
 
@@ -118,8 +134,9 @@ if (MCRAW_BUILD_PYTHON AND MCRAW_BUILD_RENDER)
     pybind11_add_module(mcraw python/mcraw_py.cpp)
     target_link_libraries(mcraw PRIVATE mcraw_color)
     if (MSVC)
-        target_compile_options(mcraw PRIVATE /utf-8 /W4)
+        target_compile_options(mcraw PRIVATE /utf-8 /W4 /arch:AVX2 /fp:fast)
     else()
-        target_compile_options(mcraw PRIVATE -Wall -O3)
+        target_compile_options(mcraw PRIVATE
+            -Wall -O3 -mavx2 -mfma -ffast-math)
     endif()
 endif()

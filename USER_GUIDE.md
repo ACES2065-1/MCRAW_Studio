@@ -10,6 +10,18 @@ Designed for VFX, color, and "I just want a normal video" workflows alike.
 
 ---
 
+## Requirements
+
+- **Windows 10 / 11 x64.**
+- **A CPU with AVX2.** Anything from Intel Haswell (2013) / AMD Excavator
+  (2015) or newer. If your machine is older than that, the app will refuse
+  to start with an "Illegal Instruction" error — sorry.
+- For GPU encoding (H.264 / H.265 / AV1 NVENC), an NVIDIA card with a
+  current driver. The CPU codecs (ProRes, DNxHR, CineForm, x264, x265)
+  work on any system.
+
+---
+
 ## Getting started
 
 1. Download `MCRAWStudio.exe`. No installer.
