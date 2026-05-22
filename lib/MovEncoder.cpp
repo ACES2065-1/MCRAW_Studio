@@ -139,6 +139,14 @@ struct MovEncoder::Impl {
     // we use the regular CPU YUV pipeline (Phase B doesn't cover Rec.2020
     // or 10-bit yet — those land in a follow-up patch).
     bool useCudaDirectKernel = false;
+
+    // Phase C.2 state. When useGpuBayerPipeline is true the caller passes
+    // bayer + WB + LSM via WriteVideoFrameFromBayer and the encoder runs
+    // the full bayer->NV12 chain on GPU. Constants here are clip-constant
+    // (set once by EnableGpuBayerPipeline); per-frame data (asShotNeutral
+    // and LSM) is passed each WriteVideoFrameFromBayer call.
+    bool useGpuBayerPipeline = false;
+    motioncam::cuda::BayerPipelineConstants bayerConsts{};
 #endif
 };
 
@@ -821,6 +829,243 @@ const char* CodecName(Codec c) {
 
 bool IsNvenc(Codec c) {
     return c == Codec::H264NVENC || c == Codec::H265NVENC || c == Codec::AV1NVENC;
+}
+
+#if MCRAW_HAVE_CUDA
+// ---------------------------------------------------------------------------
+//  Tier 2.1 Phase C.2 — GPU bayer pipeline integration
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// All the constants we need to reproduce ColorPipeline.cpp's per-target
+// matrix on the encoder side. Kept here so we don't have to drag the
+// color pipeline into MovEncoder.hpp; refactored into a shared helper if
+// we end up needing this in a third place.
+
+constexpr float kBradfordD50toD60[9] = {
+     0.96766f, -0.01686f,  0.04424f,
+    -0.02099f,  1.00778f,  0.01477f,
+     0.00853f, -0.01415f,  1.22963f,
+};
+constexpr float kXyzD60toAP1[9] = {
+     1.6410233797f, -0.3248032942f, -0.2364246952f,
+    -0.6636628587f,  1.6153315917f,  0.0167563477f,
+     0.0117218943f, -0.0082844420f,  0.9883948585f,
+};
+// Same AP1->Rec.709 matrix as BakedTransform.cpp.
+constexpr float kAP1toRec709[9] = {
+     1.7050514f, -0.6217908f, -0.0832606f,
+    -0.1302561f,  1.1408047f, -0.0105486f,
+    -0.0240083f, -0.1289693f,  1.1529777f,
+};
+// AP1 -> AP0 from the ACES spec.
+constexpr float kAP1toAP0[9] = {
+     0.6954522f,  0.1406787f,  0.1638691f,
+     0.0447946f,  0.8596711f,  0.0955343f,
+    -0.0055258f,  0.0040252f,  1.0015007f,
+};
+
+void Mat3Mul(const float A[9], const float B[9], float out[9]) {
+    for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+            out[i*3+j] = A[i*3+0]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+}
+
+// Mirrors ColorPipeline.cpp BuildCameraToAcescg / BakedTransform's plan
+// table. Output: combined cam -> target matrix + curve code matching the
+// CUDA kernel's enum (0=None, 1=Gamma22, 2=Gamma24, 3=SRGB).
+//
+// Returns false if `target` isn't bake-compatible — the caller should
+// skip Phase C in that case.
+//
+// `target` is OutputColorSpace cast to int; values come from
+// motioncam::color::OutputColorSpace which we don't include here to keep
+// the encoder loosely coupled. The supported integer values must match
+// the enum's declaration order in ColorPipeline.hpp:
+//   0 ACEScg, 1 LinearRec709, 2 ACES2065_1, 6 Rec709Gamma22,
+//   7 Rec709Display, 5 SRGB
+// (See OutputColorSpace in ColorPipeline.hpp for the canonical list.)
+bool BuildBakedCamToOutput(
+    int target, const float forwardMatrix2[9],
+    float outMatrix[9], int& outCurve)
+{
+    // Build cam -> ACEScg (D50 -> D60 -> AP1) as the common base.
+    float tmp[9], camToAcescg[9];
+    Mat3Mul(kBradfordD50toD60, forwardMatrix2, tmp);
+    Mat3Mul(kXyzD60toAP1, tmp, camToAcescg);
+
+    const float* baked = nullptr;
+    outCurve = 0;
+    switch (target) {
+        case 0:  baked = nullptr;        outCurve = 0; break;  // ACEScg
+        case 1:  baked = kAP1toRec709;   outCurve = 0; break;  // LinearRec709
+        case 2:  baked = kAP1toAP0;      outCurve = 0; break;  // ACES2065_1
+        case 5:  baked = kAP1toRec709;   outCurve = 3; break;  // SRGB
+        case 6:  baked = kAP1toRec709;   outCurve = 1; break;  // Rec709Gamma22
+        case 7:  baked = kAP1toRec709;   outCurve = 2; break;  // Rec709Display
+        default: return false;
+    }
+
+    if (baked) {
+        Mat3Mul(baked, camToAcescg, outMatrix);
+    } else {
+        std::memcpy(outMatrix, camToAcescg, sizeof(float) * 9);
+    }
+    return true;
+}
+
+// Same CFA -> channel mapping the CPU NormalizeBayer uses (per the
+// CfaChannelMap helper in Debayer.cpp). Caller passes CfaPattern as int.
+void CfaMaps(int cfaPattern, int chMap[4], int cfaToLsm[4]) {
+    switch (cfaPattern) {
+        case 0:  // RGGB
+            chMap[0]=0; chMap[1]=1; chMap[2]=1; chMap[3]=2;
+            cfaToLsm[0]=0; cfaToLsm[1]=1; cfaToLsm[2]=2; cfaToLsm[3]=3; return;
+        case 1:  // BGGR
+            chMap[0]=2; chMap[1]=1; chMap[2]=1; chMap[3]=0;
+            cfaToLsm[0]=3; cfaToLsm[1]=2; cfaToLsm[2]=1; cfaToLsm[3]=0; return;
+        case 2:  // GRBG
+            chMap[0]=1; chMap[1]=0; chMap[2]=2; chMap[3]=1;
+            cfaToLsm[0]=1; cfaToLsm[1]=0; cfaToLsm[2]=3; cfaToLsm[3]=2; return;
+        case 3:  // GBRG
+            chMap[0]=1; chMap[1]=2; chMap[2]=0; chMap[3]=1;
+            cfaToLsm[0]=2; cfaToLsm[1]=3; cfaToLsm[2]=0; cfaToLsm[3]=1; return;
+        default:
+            // Fall back to RGGB so we never get uninitialised garbage.
+            chMap[0]=0; chMap[1]=1; chMap[2]=1; chMap[3]=2;
+            cfaToLsm[0]=0; cfaToLsm[1]=1; cfaToLsm[2]=2; cfaToLsm[3]=3; return;
+    }
+}
+
+}  // namespace
+#endif  // MCRAW_HAVE_CUDA
+
+bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
+#if MCRAW_HAVE_CUDA
+    // Phase C builds on Phase B's NV12 hwframe pipeline. If Phase B isn't
+    // active for this encoder (e.g. user didn't set MCRAW_GPU_YUV, or the
+    // codec / output combo isn't supported), Phase C can't run either.
+    if (!p->useCudaDirectKernel) return false;
+
+    // Build the combined cam -> target matrix and the curve code.
+    float fullMatrix[9];
+    int curve = 0;
+    if (!BuildBakedCamToOutput(setup.targetColorSpace,
+                                setup.forwardMatrix2,
+                                fullMatrix, curve)) {
+        fprintf(stderr,
+            "[MovEncoder] Phase C bayer pipeline: target colourspace %d "
+            "isn't BakedTransform-compatible; staying on the CPU bayer "
+            "pipeline (Phase B's RGB->NV12 still runs on the GPU).\n",
+            setup.targetColorSpace);
+        return false;
+    }
+
+    int chMap[4], cfaToLsm[4];
+    CfaMaps(setup.cfaPattern, chMap, cfaToLsm);
+
+    auto& C = p->bayerConsts;
+    std::memcpy(C.cam_to_output, fullMatrix, sizeof(fullMatrix));
+    for (int i = 0; i < 4; ++i) {
+        C.black[i]        = setup.blackPerPosition[i];
+        const double dr   = setup.whiteLevel - double(setup.blackPerPosition[i]);
+        C.inv_range[i]    = dr > 0.0 ? float(1.0 / dr) : 0.0f;
+        C.cfa_channel[i]  = chMap[i];
+        C.cfa_to_lsm[i]   = cfaToLsm[i];
+    }
+    C.curve  = curve;
+    C.width  = p->settings.width;
+    C.height = p->settings.height;
+    C.lsm_w  = 0;
+    C.lsm_h  = 0;
+    C.lsm_host = nullptr;
+
+    p->useGpuBayerPipeline = true;
+    fprintf(stderr,
+        "[MovEncoder] Phase C bayer pipeline enabled (target=%d, curve=%d).\n",
+        setup.targetColorSpace, curve);
+    return true;
+#else
+    (void)setup;
+    return false;
+#endif
+}
+
+bool MovEncoder::HasGpuBayerPipeline() const {
+#if MCRAW_HAVE_CUDA
+    return p->useGpuBayerPipeline;
+#else
+    return false;
+#endif
+}
+
+void MovEncoder::WriteVideoFrameFromBayer(
+    const uint16_t* bayer,
+    const float wb[3],
+    const float* lsm,
+    int lsmWidth,
+    int lsmHeight)
+{
+#if MCRAW_HAVE_CUDA
+    if (!p->useGpuBayerPipeline) {
+        Throw("WriteVideoFrameFromBayer called but Phase C bayer pipeline "
+              "isn't active; caller must check HasGpuBayerPipeline() first.");
+    }
+
+    // Per-frame LSM (matches what the CPU pipeline does in Debayer.cpp).
+    auto& C = p->bayerConsts;
+    if (lsm && lsmWidth >= 2 && lsmHeight >= 2) {
+        C.lsm_w    = lsmWidth;
+        C.lsm_h    = lsmHeight;
+        C.lsm_host = lsm;
+    } else {
+        C.lsm_w    = 0;
+        C.lsm_h    = 0;
+        C.lsm_host = nullptr;
+    }
+
+    // Borrow an NV12 hwframe from the pool (same pool as Phase B uses).
+    AVFrame* hwFrame = av_frame_alloc();
+    if (!hwFrame) Throw("av_frame_alloc(hw) failed");
+    int hwErr = av_hwframe_get_buffer(p->hwFramesCtx, hwFrame, 0);
+    if (hwErr < 0) {
+        av_frame_free(&hwFrame);
+        ThrowAv("av_hwframe_get_buffer", hwErr);
+    }
+
+    // Full chain on GPU: bayer -> normalise -> LSM -> debayer -> matrix
+    // + curve -> NV12. Writes directly into the hwframe's Y/UV planes.
+    const bool ok = motioncam::cuda::ProcessBayerToNv12(
+        bayer, wb, C,
+        hwFrame->data[0], hwFrame->data[1],
+        hwFrame->linesize[0], hwFrame->linesize[1]);
+    if (!ok) {
+        av_frame_free(&hwFrame);
+        Throw("ProcessBayerToNv12 kernel failed");
+    }
+
+    hwFrame->pts = p->videoPts++;
+    int err = avcodec_send_frame(p->videoCtx, hwFrame);
+    av_frame_free(&hwFrame);
+    if (err < 0) ThrowAv("avcodec_send_frame(video, hw bayer)", err);
+
+    // Drain encoded packets — same code as the regular WriteVideoFrame.
+    while (true) {
+        int rec = avcodec_receive_packet(p->videoCtx, p->pkt);
+        if (rec == AVERROR(EAGAIN) || rec == AVERROR_EOF) break;
+        if (rec < 0) ThrowAv("avcodec_receive_packet(video)", rec);
+        av_packet_rescale_ts(p->pkt, p->videoCtx->time_base, p->videoStream->time_base);
+        p->pkt->stream_index = p->videoStream->index;
+        err = av_interleaved_write_frame(p->fmt, p->pkt);
+        if (err < 0) ThrowAv("av_interleaved_write_frame(video)", err);
+        av_packet_unref(p->pkt);
+    }
+#else
+    (void)bayer; (void)wb; (void)lsm; (void)lsmWidth; (void)lsmHeight;
+    Throw("WriteVideoFrameFromBayer: this build was compiled without CUDA "
+          "support; rebuild with MCRAW_ENABLE_CUDA=ON.");
+#endif
 }
 
 bool IsTenBitNative(Codec c) {

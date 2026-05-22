@@ -424,8 +424,9 @@ bool ProcessBayerToRgb(
     err = cudaGetLastError();
     if (err != cudaSuccess) return false;
 
-    // 5. Copy result to host for verification. Phase C.2 removes this and
-    //    feeds gRgbFloat straight into the Phase B RGB->NV12 kernel.
+    // 5. Copy result to host for verification (Phase C.1 only, used by
+    //    the Python correctness binding). Phase C.2's ProcessBayerToNv12
+    //    skips this step entirely.
     err = cudaMemcpy(
         rgb_host_out, gRgbFloat,
         n * 3 * sizeof(float),
@@ -434,6 +435,105 @@ bool ProcessBayerToRgb(
 
     err = cudaDeviceSynchronize();
     return err == cudaSuccess;
+}
+
+bool ProcessBayerToNv12(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    void* y_device,
+    void* uv_device,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes)
+{
+    // Phase C.2 fast path. Identical to ProcessBayerToRgb up through the
+    // matrix kernel, then chains the resident gRgbFloat into the Phase B
+    // NV12 converter (calling RgbFloatToNv12FromDevice with a device-side
+    // RGB pointer). Total H<->D transfers per frame: one bayer upload, one
+    // NV12 already-in-the-hwframe pointer. No RGB copy back to host.
+
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !y_device || !uv_device || !wb) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
+
+    const int W = C.width;
+    const int H = C.height;
+    const size_t n = size_t(W) * size_t(H);
+
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    if (!EnsureBuffers(W, H)) return false;
+
+    cudaError_t err = cudaMemcpyAsync(
+        gBayerU16, bayer_host, n * sizeof(uint16_t),
+        cudaMemcpyHostToDevice, 0);
+    if (err != cudaSuccess) return false;
+
+    float blacks[4];
+    float scales[4];
+    for (int i = 0; i < 4; ++i) {
+        const float invWb_c = 1.0f / wb[C.cfa_channel[i]];
+        blacks[i] = float(C.black[i]);
+        scales[i] = C.inv_range[i] * invWb_c;
+    }
+
+    dim3 block(32, 8);
+    dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+
+    NormalizeBayerKernel<<<grid, block>>>(
+        gBayerU16, gBayerFloat,
+        W, H,
+        blacks[0], blacks[1], blacks[2], blacks[3],
+        scales[0], scales[1], scales[2], scales[3]);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+
+    if (C.lsm_w >= 2 && C.lsm_h >= 2 && C.lsm_host) {
+        const size_t lsmBytes = size_t(C.lsm_w) * size_t(C.lsm_h) * 4 * sizeof(float);
+        if (C.lsm_w != gLsmW || C.lsm_h != gLsmH || gLsmDevice == nullptr) {
+            if (gLsmDevice) { cudaFree(gLsmDevice); gLsmDevice = nullptr; }
+            err = cudaMalloc(reinterpret_cast<void**>(&gLsmDevice), lsmBytes);
+            if (err != cudaSuccess) return false;
+            gLsmW = C.lsm_w;
+            gLsmH = C.lsm_h;
+        }
+        err = cudaMemcpyAsync(gLsmDevice, C.lsm_host, lsmBytes,
+                              cudaMemcpyHostToDevice, 0);
+        if (err != cudaSuccess) return false;
+
+        ApplyLensShadingKernel<<<grid, block>>>(
+            gBayerFloat, W, H,
+            gLsmDevice, C.lsm_w, C.lsm_h,
+            C.cfa_to_lsm[0], C.cfa_to_lsm[1],
+            C.cfa_to_lsm[2], C.cfa_to_lsm[3]);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) return false;
+    }
+
+    DebayerBilinearKernel<<<grid, block>>>(
+        gBayerFloat, gRgbFloat,
+        W, H,
+        C.cfa_channel[0], C.cfa_channel[1],
+        C.cfa_channel[2], C.cfa_channel[3]);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+
+    ApplyMatrixCurveKernel<<<grid, block>>>(
+        gRgbFloat,
+        W, H,
+        C.cam_to_output[0], C.cam_to_output[1], C.cam_to_output[2],
+        C.cam_to_output[3], C.cam_to_output[4], C.cam_to_output[5],
+        C.cam_to_output[6], C.cam_to_output[7], C.cam_to_output[8],
+        C.curve);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+
+    // Chain straight into the Phase B NV12 converter. RgbFloatToNv12FromDevice
+    // launches its own kernel + cudaDeviceSynchronize, so we don't need
+    // another sync here.
+    return RgbFloatToNv12FromDevice(
+        gRgbFloat, y_device, uv_device,
+        W, H,
+        y_pitch_bytes, uv_pitch_bytes);
 }
 
 }

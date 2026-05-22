@@ -67,6 +67,19 @@ bool RgbFloatToNv12(
 // of the process.
 void ReleaseRgbScratch();
 
+// Variant of RgbFloatToNv12 that takes a device-side RGB pointer instead
+// of a host pointer. Used by Phase C to chain the output of the bayer
+// kernels straight into NVENC without a CPU roundtrip. Pitch must equal
+// width*sizeof(float3) (we don't currently use a strided RGB layout).
+bool RgbFloatToNv12FromDevice(
+    const void* rgb_device,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
+
 // ---------- Phase C: bayer -> RGB on GPU --------------------------------
 //
 // Per-clip constants (built once when the encoder starts, identical across
@@ -116,6 +129,19 @@ bool ProcessBayerToRgb(
     const float wb[3],
     const BayerPipelineConstants& consts,
     float* rgb_host_out);
+
+// Phase C.2 entry point. Same bayer pipeline as ProcessBayerToRgb but
+// instead of copying the result to host, hands the GPU RGB straight to
+// the Phase B RGB->NV12 kernel and writes the result into the caller-
+// supplied NVENC hwframe Y/UV device pointers. No host roundtrip.
+bool ProcessBayerToNv12(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    void* y_device,
+    void* uv_device,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
 
 }
 }

@@ -239,5 +239,37 @@ void ReleaseRgbScratch() {
     }
 }
 
+bool RgbFloatToNv12FromDevice(
+    const void* rgb_device,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes)
+{
+    // Same kernel, same block geometry — only difference is the input is
+    // already on the device, so we skip the cudaMemcpyAsync that
+    // RgbFloatToNv12 does.
+    if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
+    if (!rgb_device || !y_device || !uv_device) return false;
+
+    dim3 block(32, 8);
+    dim3 grid((width  + block.x - 1) / block.x,
+              (height + block.y - 1) / block.y);
+
+    RgbFloatToNv12Kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(rgb_device),
+        static_cast<uint8_t*>(y_device),
+        static_cast<uint8_t*>(uv_device),
+        width, height,
+        y_pitch_bytes, uv_pitch_bytes);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+    err = cudaDeviceSynchronize();
+    return err == cudaSuccess;
+}
+
 }
 }

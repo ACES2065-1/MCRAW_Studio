@@ -366,6 +366,67 @@ static void DoRender(
         mcv::MovEncoder enc(es);
         const int total_to_render = e - s;
 
+        // Denoise: MP4 only, and only when at least one strength is > 0.
+        const bool wantDenoise = EndsWithMp4(output)
+            && (denoise_chroma > 0 || denoise_luma > 0);
+
+        // Tier 2.1 Phase C.2: GPU bayer pipeline opt-in. Enabled when the
+        // encoder is on the Phase B CUDA hwframe path (MCRAW_GPU_YUV=1 +
+        // NVENC + compatible codec), the user didn't request highlight
+        // recovery / denoise (no GPU kernel yet), and the target colour
+        // space has a BakedTransform. Falls back silently to the CPU
+        // producer-consumer below otherwise.
+        bool gpuBayerActive = false;
+        if (!highlight_recovery && !wantDenoise) {
+            mcv::MovEncoder::GpuBayerSetup setup{};
+            setup.targetColorSpace = static_cast<int>(cs);
+            std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
+                        sizeof(setup.forwardMatrix2));
+            for (int i = 0; i < 4; ++i)
+                setup.blackPerPosition[i] = params0.blackPerPosition[i];
+            setup.whiteLevel = params0.whiteLevel;
+            setup.cfaPattern = static_cast<int>(params0.cfa);
+            gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
+        }
+
+        if (gpuBayerActive) {
+            // Sequential GPU bayer pipeline: decode -> upload bayer ->
+            // normalise + LSM + debayer + matrix + RGB->NV12 -> NVENC.
+            // CPU has almost nothing to do per frame so the producer-
+            // consumer overlap below doesn't pay off.
+            int written = 0;
+            {
+                const uint16_t* raw0 = reinterpret_cast<const uint16_t*>(rawBuf.data());
+                const float* lsm = params0.lensShadingMap.empty()
+                    ? nullptr : params0.lensShadingMap.data();
+                enc.WriteVideoFrameFromBayer(
+                    raw0, params0.asShotNeutral,
+                    lsm, int(params0.lsmWidth), int(params0.lsmHeight));
+                ++written;
+                if (has_progress) {
+                    py::gil_scoped_acquire gil;
+                    try { progress_obj(written, total_to_render); } catch (...) {}
+                }
+            }
+            std::vector<uint8_t> rb;
+            nlohmann::json fm;
+            for (int i = s + 1; i < e; ++i) {
+                if (cancel_check()) break;
+                decoder.loadFrame(frames[i], rb, fm);
+                auto p = mcc::BuildFrameParams(fm, containerMeta);
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
+                const float* lsm = p.lensShadingMap.empty()
+                    ? nullptr : p.lensShadingMap.data();
+                enc.WriteVideoFrameFromBayer(
+                    raw, p.asShotNeutral, lsm,
+                    int(p.lsmWidth), int(p.lsmHeight));
+                ++written;
+                if (has_progress) {
+                    py::gil_scoped_acquire gil;
+                    try { progress_obj(written, total_to_render); } catch (...) {}
+                }
+            }
+        } else {
         // Producer-consumer: producer thread runs decode + color pipeline;
         // main thread runs the encoder. Decode of frame N+1 overlaps with
         // encode of frame N — ~30-50% throughput win on multi-core.
@@ -382,10 +443,6 @@ static void DoRender(
         std::atomic<bool> cancel{false};
         bool producer_done = false;
         std::exception_ptr producer_err;
-
-        // Denoise: MP4 only, and only when at least one strength is > 0.
-        const bool wantDenoise = EndsWithMp4(output)
-            && (denoise_chroma > 0 || denoise_luma > 0);
 
         // Process the already-probed first frame and queue it.
         {
@@ -481,6 +538,7 @@ static void DoRender(
         }
         producer.join();
         if (producer_err) std::rethrow_exception(producer_err);
+        }  // end CPU producer-consumer branch
 
         if (es.audioSampleRate > 0 && es.audioChannels > 0) {
             std::vector<mc::AudioChunk> chunks;

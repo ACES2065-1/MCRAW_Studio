@@ -286,9 +286,71 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
 
     motioncam::video::MovEncoder enc(es);
 
+    // Denoise applies to MP4 deliverables only — MOV stays clean for NLE
+    // workflows. Skip the call entirely when both strengths are 0.
+    const bool wantDenoise = (args.format == OutputFormat::Mp4) &&
+                             (args.denoiseChroma > 0 || args.denoiseLuma > 0);
+
+    // ----- Tier 2.1 Phase C.2: GPU bayer pipeline opt-in --------------------
+    // When the encoder is using Phase B's CUDA hwframe path (MCRAW_GPU_YUV=1
+    // + NVENC + supported codec), and the user didn't ask for highlight
+    // recovery or denoise (neither has a GPU kernel yet), and the output
+    // colour space has a BakedTransform — enable the full GPU bayer pipeline.
+    // Falls back silently to the CPU producer-consumer below otherwise.
+    bool gpuBayerActive = false;
+    if (!args.highlightRecovery && !wantDenoise) {
+        motioncam::video::MovEncoder::GpuBayerSetup setup{};
+        setup.targetColorSpace = static_cast<int>(args.colorSpace);
+        std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
+                    sizeof(setup.forwardMatrix2));
+        for (int i = 0; i < 4; ++i)
+            setup.blackPerPosition[i] = params0.blackPerPosition[i];
+        setup.whiteLevel = params0.whiteLevel;
+        setup.cfaPattern = static_cast<int>(params0.cfa);
+        gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
+    }
+
+    int written = 0;
+    const int totalToRender = end - start;
+
+    if (gpuBayerActive) {
+        // Sequential GPU bayer pipeline: decode -> upload bayer -> kernels
+        // -> NV12 -> NVENC, one frame at a time. The CPU side has almost
+        // nothing to do, so the producer-consumer overlap doesn't pay off.
+        {
+            const uint16_t* raw0 = reinterpret_cast<const uint16_t*>(rawBuf.data());
+            const float* lsm = params0.lensShadingMap.empty()
+                ? nullptr : params0.lensShadingMap.data();
+            enc.WriteVideoFrameFromBayer(
+                raw0, params0.asShotNeutral,
+                lsm, int(params0.lsmWidth), int(params0.lsmHeight));
+            ++written;
+        }
+        std::vector<uint8_t> rb;
+        nlohmann::json fm;
+        for (int i = start + 1; i < end; ++i) {
+            decoder.loadFrame(frames[i], rb, fm);
+            auto p = motioncam::color::BuildFrameParams(fm, containerMeta);
+            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
+            const float* lsm = p.lensShadingMap.empty()
+                ? nullptr : p.lensShadingMap.data();
+            enc.WriteVideoFrameFromBayer(
+                raw, p.asShotNeutral, lsm,
+                int(p.lsmWidth), int(p.lsmHeight));
+            ++written;
+            if (written % 24 == 0) {
+                std::cout << "Encoded frame " << written << "/"
+                          << totalToRender << "\r" << std::flush;
+            }
+        }
+        std::cout << "\n";
+        goto after_video_loop;
+    }
+
     // Producer-consumer pipeline: producer thread runs decode + color
     // (loadFrame, ProcessFrame, OCIO) so it overlaps with the encoder
     // running on the main thread. ~30-50% throughput win on multi-core.
+    {
     struct ProcessedFrame {
         std::vector<float> rgb;
         uint32_t width;
@@ -302,11 +364,6 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     std::atomic<bool> cancel{false};
     bool producer_done = false;
     std::exception_ptr producer_err;
-
-    // Denoise applies to MP4 deliverables only — MOV stays clean for NLE
-    // workflows. Skip the call entirely when both strengths are 0.
-    const bool wantDenoise = (args.format == OutputFormat::Mp4) &&
-                             (args.denoiseChroma > 0 || args.denoiseLuma > 0);
 
     // Process the already-probed first frame and queue it.
     {
@@ -367,8 +424,6 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
         not_empty.notify_all();
     });
 
-    int written = 0;
-    const int totalToRender = end - start;
     try {
         while (true) {
             std::unique_lock<std::mutex> lk(mtx);
@@ -395,7 +450,9 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     producer.join();
     if (producer_err) std::rethrow_exception(producer_err);
     std::cout << "\n";
+    }  // end producer-consumer block (was opened above gpuBayerActive check)
 
+after_video_loop:
     if (es.audioSampleRate > 0 && es.audioChannels > 0) {
         std::vector<motioncam::AudioChunk> audioChunks;
         decoder.loadAudio(audioChunks);

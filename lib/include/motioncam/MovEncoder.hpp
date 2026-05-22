@@ -68,6 +68,62 @@ public:
     void WriteAudio(const int16_t* samples, int numSamplesTotal);
     void Finalize();
 
+    // ----- Tier 2.1 Phase C.2: GPU bayer pipeline ------------------------
+    //
+    // Optional fast path that does the whole bayer -> NV12 chain on the
+    // GPU and feeds the result straight into NVENC. Eliminates the CPU
+    // NormalizeBayer + LSM + Debayer + Matrix + sws_scale steps.
+    //
+    // To use:
+    //   1. Construct MovEncoder as usual (chooses NVENC, opens the
+    //      CUDA hwframes context per Phase A/B if MCRAW_GPU_YUV=1).
+    //   2. Call EnableGpuBayerPipeline() exactly once after the
+    //      constructor returns. Returns true only if:
+    //        - The codec is an NVENC variant (h264_nvenc / h265_nvenc /
+    //          av1_nvenc) AND the Phase B kernel is active.
+    //        - The output target has a BakedTransform (sRGB / Rec.709
+    //          family / ACEScg / ACES2065-1). OCIO-only targets fall
+    //          back to the CPU pipeline.
+    //        - This binary was compiled with CUDA support.
+    //      Returns false otherwise; the caller should continue using
+    //      WriteVideoFrame(rgb) and run the CPU pipeline itself.
+    //   3. For each frame, call WriteVideoFrameFromBayer() instead of
+    //      WriteVideoFrame(). The encoder owns the entire processing
+    //      chain from raw bayer to NVENC-encoded packet.
+    struct GpuBayerSetup {
+        // OutputColorSpace value cast to int. Must be a BakedTransform-
+        // compatible target (ACEScg / LinearRec709 / ACES2065-1 /
+        // Rec709Gamma22 / Rec709Display / SRGB). Anything else makes
+        // EnableGpuBayerPipeline return false.
+        int      targetColorSpace;
+
+        // From container metadata. ForwardMatrix2 is DNG's camera->XYZ_D50
+        // matrix (row-major). blackPerPosition / whiteLevel set the
+        // sensor's dynamic range. cfaPattern is CfaPattern as int (0=RGGB,
+        // 1=BGGR, 2=GRBG, 3=GBRG).
+        float    forwardMatrix2[9];
+        uint16_t blackPerPosition[4];
+        double   whiteLevel;
+        int      cfaPattern;
+    };
+
+    bool EnableGpuBayerPipeline(const GpuBayerSetup& setup);
+    bool HasGpuBayerPipeline() const;
+
+    // Per-frame call when the bayer pipeline is active. `bayer` points at
+    // width*height u16 raw bayer (the bytes the decoder hands you).
+    // `wb` is asShotNeutral (3 floats). `lsm` is an optional channel-first
+    // 4 * lsmW * lsmH float lens-shading-map (pass nullptr to skip).
+    //
+    // Throws std::runtime_error if EnableGpuBayerPipeline() didn't succeed
+    // — the caller is expected to check HasGpuBayerPipeline() first.
+    void WriteVideoFrameFromBayer(
+        const uint16_t* bayer,
+        const float     wb[3],
+        const float*    lsm,
+        int             lsmWidth,
+        int             lsmHeight);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> p;
