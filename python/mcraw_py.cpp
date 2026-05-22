@@ -11,6 +11,10 @@
 #include <motioncam/MovEncoder.hpp>
 #include <motioncam/Trimmer.hpp>
 
+#if MCRAW_HAVE_CUDA
+#include <motioncam/CudaHwHandoff.hpp>
+#endif
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 }
@@ -650,6 +654,32 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
             "dnxhr_hqx", "dnxhr_444", "cineform",
         };
     }, "List supported video codecs (h264_nvenc / h265_nvenc / av1_nvenc require an NVIDIA GPU).");
+
+    // ---- CUDA probes (Tier 2.1 GPU pipeline) ----
+    m.def("cuda_built", []() -> bool {
+#if MCRAW_HAVE_CUDA
+        return true;
+#else
+        return false;
+#endif
+    }, "Whether this build was compiled with CUDA support. False = CPU-only.");
+
+    m.def("cuda_available", []() -> bool {
+#if MCRAW_HAVE_CUDA
+        return motioncam::cuda::IsCudaAvailable();
+#else
+        return false;
+#endif
+    }, "Whether a CUDA-capable GPU is visible at runtime (requires NVIDIA driver).");
+
+    m.def("cuda_phase_a_probe", []() -> bool {
+#if MCRAW_HAVE_CUDA
+        return motioncam::cuda::RunPhaseAProbe();
+#else
+        return false;
+#endif
+    }, "Tier 2.1 Phase A health check: launches a no-op CUDA kernel and "
+       "synchronises. Returns true if the kernel completed without error.");
 
     m.def("encoder_available", [](const std::string& name) -> bool {
         // Two-step check: codec compiled into FFmpeg, AND it can actually open
