@@ -885,8 +885,75 @@ class MainWindow(QtWidgets.QMainWindow):
         outer.addLayout(actions)
 
         self.statusBar().showMessage("Ready")
+        self._build_gpu_indicator()
         self._format_changed()
         self._build_menus()
+
+    def _build_gpu_indicator(self) -> None:
+        """Permanent right-side status-bar widget showing whether NVENC
+        renders will take the CUDA RGB->NV12 kernel path (Phase B).
+
+        States:
+          "GPU YUV: ON  (NVENC)" - MCRAW_GPU_YUV=1 + this binary has CUDA
+                                   + a CUDA-capable GPU is visible.
+          "GPU YUV: off"         - default; CPU sws_scale path for all
+                                   codecs including NVENC.
+          "GPU YUV: off (no GPU)" - env var set but no NVIDIA card found
+                                   at runtime; CPU path used silently.
+          "GPU YUV: off (no CUDA)" - this build wasn't compiled with CUDA
+                                   support; CPU path always.
+
+        Only affects NVENC encoders. ProRes / DNxHR / CineForm / x264 /
+        x265 / EXR are unaffected by this flag — they're always CPU.
+        """
+        label = QtWidgets.QLabel()
+        label.setObjectName("gpuIndicator")
+        label.setStyleSheet(
+            "QLabel#gpuIndicator { padding: 0 8px; color: #888; }"
+        )
+
+        try:
+            built = bool(mcraw.cuda_built())
+        except Exception:
+            built = False
+        try:
+            available = bool(mcraw.cuda_available()) if built else False
+        except Exception:
+            available = False
+        env_value = os.environ.get("MCRAW_GPU_YUV", "")
+        env_set = env_value == "1"
+
+        if not built:
+            text = "GPU YUV: off (no CUDA in build)"
+            tip = ("This build of MCRAW Studio wasn't compiled with CUDA "
+                   "support. NVENC renders still work but always go through "
+                   "the CPU YUV pipeline.")
+        elif env_set and available:
+            text = "GPU YUV: ON  (NVENC only)"
+            label.setStyleSheet(
+                "QLabel#gpuIndicator { padding: 0 8px; color: #6abe6a; }"
+            )
+            tip = ("MCRAW_GPU_YUV=1 detected and a CUDA-capable GPU is "
+                   "visible. NVENC renders (h264_nvenc / h265_nvenc / "
+                   "av1_nvenc) at 8-bit BT.709 / sRGB / Rec.709 will use "
+                   "the GPU RGB->NV12 kernel. Rec.2020 PQ/HLG and 10-bit "
+                   "NVENC still take the CPU YUV path.")
+        elif env_set and not available:
+            text = "GPU YUV: off (no NVIDIA GPU)"
+            tip = ("MCRAW_GPU_YUV=1 is set, but no CUDA-capable GPU was "
+                   "detected at startup. Falling back to the CPU YUV "
+                   "pipeline. Install or update your NVIDIA driver if "
+                   "you expected a GPU here.")
+        else:
+            text = "GPU YUV: off"
+            tip = ("CPU YUV pipeline (sws_scale). To enable the GPU path "
+                   "for NVENC renders, launch MCRAW Studio via the "
+                   "'MCRAWStudio (GPU).bat' launcher, or set the "
+                   "MCRAW_GPU_YUV=1 environment variable.")
+
+        label.setText(text)
+        label.setToolTip(tip)
+        self.statusBar().addPermanentWidget(label)
 
     # ----- Menus -----
     def _build_menus(self) -> None:
@@ -1826,7 +1893,7 @@ def _load_stylesheet() -> str:
         return ""
 
 
-APP_VERSION = "0.2.0"
+APP_VERSION = "0.2.1"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"
