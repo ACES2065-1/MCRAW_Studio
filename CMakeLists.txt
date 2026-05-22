@@ -109,7 +109,9 @@ if (MCRAW_BUILD_RENDER)
         lib/MovEncoder.cpp
     )
     if (MCRAW_HAVE_CUDA)
-        list(APPEND MCRAW_COLOR_SOURCES lib/cuda/HwHandoff.cu)
+        list(APPEND MCRAW_COLOR_SOURCES
+            lib/cuda/HwHandoff.cu
+            lib/cuda/BayerPipeline.cu)
     endif()
 
     add_library(mcraw_color ${MCRAW_COLOR_SOURCES})
