@@ -27,6 +27,7 @@ the GitHub Release linked here, not from a third-party mirror.
 |---------|------------|------------|--------------------------------------------------------------------|---------|
 | 0.1.0   | 2026-05-16 | 64,344,698 | `D40C54BEAB83E9C11CC8B89DC05429F8623F91130C329EB20EB22A59BE29C34E` | [v0.1.0](https://github.com/ACES2065-1/MCRAW_Studio/releases/tag/v0.1.0) |
 | 0.1.1   | 2026-05-22 | 83,374,606 | `8078ACFDF31BAA46237DD382A62BE89EBF9C6A004C69A0D13AEBF90513844590` | [v0.1.1](https://github.com/ACES2065-1/MCRAW_Studio/releases/tag/v0.1.1) |
+| 0.2.0   | 2026-05-22 | 83,432,454 | `E3CA92B638E094BD79645D36A27BD708B49331C36E9D6A3453A7E01F851D26C4` | [v0.2.0](https://github.com/ACES2065-1/MCRAW_Studio/releases/tag/v0.2.0) |
 
 <!--
 When cutting a new release:

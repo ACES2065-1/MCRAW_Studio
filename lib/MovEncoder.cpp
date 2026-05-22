@@ -127,13 +127,18 @@ struct MovEncoder::Impl {
     bool finalized = false;
 
 #if MCRAW_HAVE_CUDA
-    // CUDA upload path (Tier 2.1 Phase A.2). Opt-in via MCRAW_GPU_YUV=1 env
-    // var. When active, WriteVideoFrame uploads the CPU yuvFrame to a CUDA
-    // hwframe and sends that to NVENC instead — skips libavcodec's internal
-    // CPU->GPU copy. Phase B will replace the sws_scale CPU step itself.
+    // CUDA upload path (Tier 2.1 Phase A.2 / B). Opt-in via MCRAW_GPU_YUV=1
+    // env var. WriteVideoFrame replaces sws_scale + CPU->GPU upload with a
+    // single GPU kernel that converts RGB float directly to NV12 in the
+    // NVENC hwframe.
     AVBufferRef* hwDeviceCtx = nullptr;
     AVBufferRef* hwFramesCtx = nullptr;
     bool useCudaUpload = false;
+    // Phase B sub-path. True iff the kernel supports the current output
+    // (8-bit NV12 / BT.709 limited). False -> CUDA path is disabled and
+    // we use the regular CPU YUV pipeline (Phase B doesn't cover Rec.2020
+    // or 10-bit yet — those land in a follow-up patch).
+    bool useCudaDirectKernel = false;
 #endif
 };
 
@@ -344,43 +349,62 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
         const bool envOptIn = envOpt && std::strcmp(envOpt, "1") == 0;
 
         if (isNvencCodec && envOptIn && motioncam::cuda::IsCudaAvailable()) {
-            int hwErr = av_hwdevice_ctx_create(&p->hwDeviceCtx,
-                AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
-            if (hwErr < 0) {
-                char buf[128]{};
-                av_strerror(hwErr, buf, sizeof(buf));
+            // Phase B kernel-supported check. The direct RGB->NV12 kernel
+            // only handles 8-bit BT.709 / unspecified at the moment.
+            // Other cases (10-bit P010, BT.2020 matrix for Rec.2020 PQ/HLG
+            // delivery) silently keep the CPU YUV pipeline — correctness
+            // first, more kernels in a follow-up patch.
+            const bool is8bit = (p->videoCtx->pix_fmt == AV_PIX_FMT_YUV420P);
+            const bool bt709Compat = (s.colorMatrix == 1 || s.colorMatrix == 2);
+            if (!is8bit || !bt709Compat) {
                 fprintf(stderr,
-                    "[MovEncoder] CUDA hwdevice init failed (%s); "
-                    "falling back to CPU YUV path.\n", buf);
+                    "[MovEncoder] CUDA path requested but output is "
+                    "%s%s — using CPU YUV.\n",
+                    !is8bit ? "10-bit" : "",
+                    !bt709Compat ? " / BT.2020" : "");
             } else {
-                AVBufferRef* framesRef = av_hwframe_ctx_alloc(p->hwDeviceCtx);
-                if (framesRef) {
-                    auto* fc = reinterpret_cast<AVHWFramesContext*>(framesRef->data);
-                    fc->format = AV_PIX_FMT_CUDA;
-                    fc->sw_format = p->videoCtx->pix_fmt;  // YUV420P or P010LE
-                    fc->width = s.width;
-                    fc->height = s.height;
-                    fc->initial_pool_size = 8;  // NVENC pipelines ~6 frames
-                    int initErr = av_hwframe_ctx_init(framesRef);
-                    if (initErr >= 0) {
-                        p->hwFramesCtx = framesRef;
-                        p->videoCtx->hw_frames_ctx = av_buffer_ref(p->hwFramesCtx);
-                        p->videoCtx->pix_fmt = AV_PIX_FMT_CUDA;
-                        p->useCudaUpload = true;
-                        fprintf(stderr,
-                            "[MovEncoder] CUDA hwupload path enabled "
-                            "(MCRAW_GPU_YUV=1).\n");
-                    } else {
-                        av_buffer_unref(&framesRef);
-                        char buf[128]{};
-                        av_strerror(initErr, buf, sizeof(buf));
-                        fprintf(stderr,
-                            "[MovEncoder] hwframes init failed (%s); "
-                            "falling back to CPU YUV path.\n", buf);
+                int hwErr = av_hwdevice_ctx_create(&p->hwDeviceCtx,
+                    AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+                if (hwErr < 0) {
+                    char buf[128]{};
+                    av_strerror(hwErr, buf, sizeof(buf));
+                    fprintf(stderr,
+                        "[MovEncoder] CUDA hwdevice init failed (%s); "
+                        "falling back to CPU YUV path.\n", buf);
+                } else {
+                    AVBufferRef* framesRef = av_hwframe_ctx_alloc(p->hwDeviceCtx);
+                    if (framesRef) {
+                        auto* fc = reinterpret_cast<AVHWFramesContext*>(framesRef->data);
+                        fc->format = AV_PIX_FMT_CUDA;
+                        // Phase B writes NV12 directly from the kernel — request
+                        // an NV12 hwframe instead of YUV420P so libavcodec
+                        // doesn't insert an extra format-conversion step.
+                        fc->sw_format = AV_PIX_FMT_NV12;
+                        fc->width = s.width;
+                        fc->height = s.height;
+                        fc->initial_pool_size = 8;
+                        int initErr = av_hwframe_ctx_init(framesRef);
+                        if (initErr >= 0) {
+                            p->hwFramesCtx = framesRef;
+                            p->videoCtx->hw_frames_ctx = av_buffer_ref(p->hwFramesCtx);
+                            p->videoCtx->pix_fmt = AV_PIX_FMT_CUDA;
+                            p->useCudaUpload = true;
+                            p->useCudaDirectKernel = true;
+                            fprintf(stderr,
+                                "[MovEncoder] CUDA RGB->NV12 kernel "
+                                "(Phase B) enabled.\n");
+                        } else {
+                            av_buffer_unref(&framesRef);
+                            char buf[128]{};
+                            av_strerror(initErr, buf, sizeof(buf));
+                            fprintf(stderr,
+                                "[MovEncoder] hwframes init failed (%s); "
+                                "falling back to CPU YUV path.\n", buf);
+                        }
                     }
-                }
-                if (!p->useCudaUpload && p->hwDeviceCtx) {
-                    av_buffer_unref(&p->hwDeviceCtx);
+                    if (!p->useCudaUpload && p->hwDeviceCtx) {
+                        av_buffer_unref(&p->hwDeviceCtx);
+                    }
                 }
             }
         }
@@ -509,6 +533,11 @@ MovEncoder::~MovEncoder() {
 #if MCRAW_HAVE_CUDA
     if (p->hwFramesCtx) av_buffer_unref(&p->hwFramesCtx);
     if (p->hwDeviceCtx) av_buffer_unref(&p->hwDeviceCtx);
+    // Release the persistent RGB upload buffer. Cheap to re-allocate on
+    // the next render, and avoids holding VRAM after the encoder is gone.
+    if (p->useCudaDirectKernel) {
+        motioncam::cuda::ReleaseRgbScratch();
+    }
 #endif
     if (p->pkt) av_packet_free(&p->pkt);
     if (p->fmt) {
@@ -521,49 +550,17 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
     const int w = p->settings.width;
     const int h = p->settings.height;
 
-    int err = av_frame_make_writable(p->rgbStaging);
-    if (err < 0) ThrowAv("av_frame_make_writable(rgb staging)", err);
-    err = av_frame_make_writable(p->yuvFrame);
-    if (err < 0) ThrowAv("av_frame_make_writable(yuv)", err);
-
-    // GBRPF32LE: planar G/B/R order. Deinterleave RGB float → GBR planes, clamp to [0,1].
-    const int gStride = p->rgbStaging->linesize[0] / static_cast<int>(sizeof(float));
-    const int bStride = p->rgbStaging->linesize[1] / static_cast<int>(sizeof(float));
-    const int rStride = p->rgbStaging->linesize[2] / static_cast<int>(sizeof(float));
-    float* gPlane = reinterpret_cast<float*>(p->rgbStaging->data[0]);
-    float* bPlane = reinterpret_cast<float*>(p->rgbStaging->data[1]);
-    float* rPlane = reinterpret_cast<float*>(p->rgbStaging->data[2]);
-
-    for (int y = 0; y < h; ++y) {
-        const float* src = rgb + static_cast<size_t>(y) * static_cast<size_t>(w) * 3;
-        float* gRow = gPlane + static_cast<size_t>(y) * static_cast<size_t>(gStride);
-        float* bRow = bPlane + static_cast<size_t>(y) * static_cast<size_t>(bStride);
-        float* rRow = rPlane + static_cast<size_t>(y) * static_cast<size_t>(rStride);
-        for (int x = 0; x < w; ++x) {
-            float r = src[x*3 + 0];
-            float g = src[x*3 + 1];
-            float b = src[x*3 + 2];
-            if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
-            if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
-            if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
-            gRow[x] = g;
-            bRow[x] = b;
-            rRow[x] = r;
-        }
-    }
-
-    sws_scale(p->sws,
-        p->rgbStaging->data, p->rgbStaging->linesize, 0, h,
-        p->yuvFrame->data, p->yuvFrame->linesize);
-
     AVFrame* frameToSend = p->yuvFrame;
+    int err = 0;
 
 #if MCRAW_HAVE_CUDA
     AVFrame* hwFrame = nullptr;
-    if (p->useCudaUpload) {
-        // Borrow a frame from the GPU pool. The pool was sized to 8 in
-        // setup; av_hwframe_get_buffer reuses slots if the previous frame
-        // has been released by NVENC.
+    if (p->useCudaDirectKernel) {
+        // Phase B fast path. Skips sws_scale entirely: kernel takes the
+        // interleaved RGB float buffer and writes NV12 straight into the
+        // NVENC hwframe. The H->D copy of the RGB happens inside the
+        // kernel wrapper (one cudaMemcpyAsync), so we don't touch
+        // p->yuvFrame / p->rgbStaging / p->sws at all.
         hwFrame = av_frame_alloc();
         if (!hwFrame) Throw("av_frame_alloc(hw) failed");
         int hwErr = av_hwframe_get_buffer(p->hwFramesCtx, hwFrame, 0);
@@ -571,9 +568,72 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
             av_frame_free(&hwFrame);
             ThrowAv("av_hwframe_get_buffer", hwErr);
         }
-        // CPU YUV -> GPU YUV. This is the actual CPU->GPU copy. Phase A
-        // doesn't save anything yet vs libavcodec's internal upload, but
-        // it sets up the contract Phase B needs to skip sws_scale entirely.
+        const bool ok = motioncam::cuda::RgbFloatToNv12(
+            rgb,
+            hwFrame->data[0], hwFrame->data[1],
+            w, h,
+            hwFrame->linesize[0], hwFrame->linesize[1]);
+        if (!ok) {
+            av_frame_free(&hwFrame);
+            Throw("RgbFloatToNv12 kernel failed");
+        }
+        frameToSend = hwFrame;
+        goto send_frame;
+    }
+#endif
+
+    err = av_frame_make_writable(p->rgbStaging);
+    if (err < 0) ThrowAv("av_frame_make_writable(rgb staging)", err);
+    err = av_frame_make_writable(p->yuvFrame);
+    if (err < 0) ThrowAv("av_frame_make_writable(yuv)", err);
+
+    // GBRPF32LE: planar G/B/R order. Deinterleave RGB float → GBR planes, clamp to [0,1].
+    {
+        const int gStride = p->rgbStaging->linesize[0] / static_cast<int>(sizeof(float));
+        const int bStride = p->rgbStaging->linesize[1] / static_cast<int>(sizeof(float));
+        const int rStride = p->rgbStaging->linesize[2] / static_cast<int>(sizeof(float));
+        float* gPlane = reinterpret_cast<float*>(p->rgbStaging->data[0]);
+        float* bPlane = reinterpret_cast<float*>(p->rgbStaging->data[1]);
+        float* rPlane = reinterpret_cast<float*>(p->rgbStaging->data[2]);
+
+        for (int y = 0; y < h; ++y) {
+            const float* src = rgb + static_cast<size_t>(y) * static_cast<size_t>(w) * 3;
+            float* gRow = gPlane + static_cast<size_t>(y) * static_cast<size_t>(gStride);
+            float* bRow = bPlane + static_cast<size_t>(y) * static_cast<size_t>(bStride);
+            float* rRow = rPlane + static_cast<size_t>(y) * static_cast<size_t>(rStride);
+            for (int x = 0; x < w; ++x) {
+                float r = src[x*3 + 0];
+                float g = src[x*3 + 1];
+                float b = src[x*3 + 2];
+                if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+                if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+                if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+                gRow[x] = g;
+                bRow[x] = b;
+                rRow[x] = r;
+            }
+        }
+    }
+
+    sws_scale(p->sws,
+        p->rgbStaging->data, p->rgbStaging->linesize, 0, h,
+        p->yuvFrame->data, p->yuvFrame->linesize);
+
+#if MCRAW_HAVE_CUDA
+    if (p->useCudaUpload && !p->useCudaDirectKernel) {
+        // Phase A.2 path. Used when MCRAW_GPU_YUV=1 was requested but the
+        // direct kernel doesn't support this output config (10-bit / BT.2020):
+        // uploads CPU YUV to GPU and lets NVENC consume that. In v0.2.0 this
+        // path is unreachable because we disable useCudaUpload when the
+        // kernel can't run — kept as scaffolding for when we add the 10-bit
+        // / BT.2020 kernels.
+        hwFrame = av_frame_alloc();
+        if (!hwFrame) Throw("av_frame_alloc(hw) failed");
+        int hwErr = av_hwframe_get_buffer(p->hwFramesCtx, hwFrame, 0);
+        if (hwErr < 0) {
+            av_frame_free(&hwFrame);
+            ThrowAv("av_hwframe_get_buffer", hwErr);
+        }
         hwErr = av_hwframe_transfer_data(hwFrame, p->yuvFrame, 0);
         if (hwErr < 0) {
             av_frame_free(&hwFrame);
@@ -583,6 +643,9 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
     }
 #endif
 
+#if MCRAW_HAVE_CUDA
+send_frame:
+#endif
     frameToSend->pts = p->videoPts++;
     err = avcodec_send_frame(p->videoCtx, frameToSend);
 

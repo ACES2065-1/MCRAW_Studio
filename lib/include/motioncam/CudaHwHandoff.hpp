@@ -32,6 +32,41 @@ bool IsCudaAvailable();
 // RGB float -> YUV converter.
 bool RunPhaseAProbe();
 
+// ---------- Phase B: RGB float -> NV12 (BT.709 limited, 8-bit) ----------
+//
+// Wraps the GPU side of "feed NVENC from our linear RGB float buffer":
+//   1) async H->D copy of width*height*3 floats into a private device
+//      buffer (managed inside the .cu file, lazily resized)
+//   2) launches the RGB->NV12 conversion kernel directly into the caller-
+//      supplied Y / UV device pointers (these come from the NVENC hwframe)
+//   3) blocks on cudaDeviceSynchronize before returning so the encoder
+//      sees a fully-written frame.
+//
+// Output convention:
+//   - 8-bit NV12 (Y plane + interleaved UV, 4:2:0 chroma subsampling)
+//   - BT.709 RGB -> Y'CbCr, limited range (Y in [16,235], CbCr in [16,240])
+//   - Input RGB is clamped to [0,1] inside the kernel
+//
+// y_device / uv_device are CUDA device pointers (the values stored in
+// AVFrame::data[0/1] when the frame's hwframes context is CUDA). The
+// pitches are AVFrame::linesize[0/1] in bytes.
+//
+// Returns false if any CUDA call fails (e.g. OOM, kernel launch error);
+// caller is expected to fall back to the CPU YUV path in that case.
+bool RgbFloatToNv12(
+    const float* rgb_host,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
+
+// Release the lazily-allocated device scratch buffer. Call this once at
+// MovEncoder destruction so the GPU memory isn't held for the lifetime
+// of the process.
+void ReleaseRgbScratch();
+
 }
 }
 
