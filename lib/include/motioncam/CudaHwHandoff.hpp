@@ -67,6 +67,56 @@ bool RgbFloatToNv12(
 // of the process.
 void ReleaseRgbScratch();
 
+// ---------- Phase C: bayer -> RGB on GPU --------------------------------
+//
+// Per-clip constants (built once when the encoder starts, identical across
+// frames). The combined matrix M is (BakedTransform * Cam->ACEScg) so a
+// single 3x3 mul gets us from cam-RGB straight to the target output space.
+// `curve` encodes the optional gamma the BakedTransform applies after the
+// matrix (matches BakedTransform.cpp's Curve enum, kept as plain int so we
+// don't have to drag a header into CUDA code).
+struct BayerPipelineConstants {
+    float    cam_to_output[9];
+    uint16_t black[4];          // per-CFA-position black level
+    float    inv_range[4];      // 1.0 / (whiteLevel - black[i])
+    int      cfa_channel[4];    // 0=R, 1=G, 2=B per CFA position (matches CfaPattern)
+    int      cfa_to_lsm[4];     // CFA position -> LSM channel index (R, Gr, Gb, B = 0..3)
+    int      curve;             // 0=None, 1=Gamma22, 2=Gamma24, 3=SRGB
+    int      width;
+    int      height;
+
+    // Optional lens-shading map. If lsm_w > 0 && lsm_h > 0 && lsm_host is
+    // non-null, the kernel multiplies each bayer pixel by the bilinearly
+    // sampled gain from lsm_host[cfa_to_lsm[idx]] grid. lsm_host points to
+    // a channel-first buffer of size 4 * lsm_w * lsm_h floats (R, Gr, Gb, B).
+    int          lsm_w;
+    int          lsm_h;
+    const float* lsm_host;
+};
+
+// One-time setup. Allocates persistent GPU buffers (bayer + intermediate
+// RGB) sized for `width * height`. Safe to call repeatedly with the same
+// dimensions — only the first call actually allocates.
+bool SetupBayerPipeline(int width, int height);
+
+// Frees the bayer / intermediate-RGB device buffers. Call at encoder
+// destruction.
+void ReleaseBayerPipeline();
+
+// Per-frame call. Uploads `bayer_host`, runs the three kernels, leaves
+// the result in the persistent GPU RGB buffer. For now, also copies the
+// result to `rgb_host` so the Python binding can verify against CPU
+// reference (will become a no-op + hwframe handoff in Phase C.2).
+//
+// `wb` is per-frame (the asShotNeutral from the MotionCam metadata).
+//
+// Returns false on any CUDA error.
+bool ProcessBayerToRgb(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    float* rgb_host_out);
+
 }
 }
 

@@ -217,6 +217,13 @@ public:
         return arr;
     }
 
+    // Internal access for free-function bindings that need to call the
+    // raw mc::Decoder (e.g. the CUDA Phase C correctness test). Not
+    // exposed to Python — it's just here because pybind11 only knows
+    // about PyDecoder, so other bindings reach the real decoder through
+    // this.
+    mc::Decoder* underlying() { return d_.get(); }
+
 private:
     void EnsureXform(mcc::OutputColorSpace cs) {
         // Re-Init only when the requested space changes — avoids reallocating
@@ -680,6 +687,205 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
 #endif
     }, "Tier 2.1 Phase A health check: launches a no-op CUDA kernel and "
        "synchronises. Returns true if the kernel completed without error.");
+
+#if MCRAW_HAVE_CUDA
+    // Phase C.1 correctness test. Runs the GPU bayer pipeline (normalise +
+    // debayer + matrix + optional curve) on a single decoded frame and
+    // returns the result as a (H, W, 3) float32 numpy array — same shape
+    // as Decoder.process_frame, so the test script can subtract the two
+    // and verify they're equal within float epsilon.
+    m.def("cuda_process_frame_phase_c",
+        [](PyDecoder& pyDec, int64_t timestamp,
+           const std::string& target_colorspace) -> py::array_t<float> {
+            mc::Decoder& dec = *pyDec.underlying();
+
+            // Map the target colorspace to a (matrix, curve) plan.
+            // Matches BakedTransform.cpp's LookupPlan(). Throws if the
+            // target isn't bake-compatible (caller should fall back to CPU).
+            mcc::OutputColorSpace cs;
+            if (!mcc::ParseOutputColorSpace(target_colorspace, cs)) {
+                throw std::runtime_error("unknown colorspace: " + target_colorspace);
+            }
+            if (!mcc::HasBakedTransform(cs)) {
+                throw std::runtime_error(
+                    "GPU pipeline doesn't support " + target_colorspace +
+                    " yet (OCIO-only output). Use a baked-transform target "
+                    "(acescg, rec709, aces2065-1, srgb, rec709-2.2, rec709-display).");
+            }
+
+            // Pull the bayer + per-frame + per-clip metadata.
+            std::vector<uint8_t> rawBuf;
+            nlohmann::json frameMeta;
+            uint32_t width = 0, height = 0;
+            mcc::FrameParams params;
+            {
+                py::gil_scoped_release release;
+                dec.loadFrame(timestamp, rawBuf, frameMeta);
+                params = mcc::BuildFrameParams(frameMeta, dec.getContainerMetadata());
+                width = params.width;
+                height = params.height;
+            }
+
+            // Build the combined cam->output matrix on CPU. Same chain the
+            // CPU pipeline uses: ForwardMatrix2 -> Bradford D50/D60 ->
+            // AP1 (ACEScg) -> BakedTransform matrix (AP1 -> output).
+            //
+            // We don't have a public helper exposing the cam->ACEScg /
+            // cam->Rec709 matrix builders from ColorPipeline.cpp, so this
+            // duplicates them. Kept short - they're 3x3 matrix muls.
+            // TODO(phase-c.2): refactor BuildCamera*() helpers into the
+            //                  public header and call them here.
+
+            // From ColorPipeline.cpp (Bradford D50->D60).
+            constexpr float Bradford_D50_to_D60[9] = {
+                 0.96766f, -0.01686f,  0.04424f,
+                -0.02099f,  1.00778f,  0.01477f,
+                 0.00853f, -0.01415f,  1.22963f,
+            };
+            // XYZ D60 -> AP1 (ACEScg) - same constants as ColorPipeline.cpp.
+            constexpr float XYZ_D60_to_AP1[9] = {
+                 1.6410233797f, -0.3248032942f, -0.2364246952f,
+                -0.6636628587f,  1.6153315917f,  0.0167563477f,
+                 0.0117218943f, -0.0082844420f,  0.9883948585f,
+            };
+
+            auto matMul = [](const float A[9], const float B[9], float out[9]) {
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        out[i*3+j] = A[i*3+0]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+            };
+
+            // cam -> XYZ_D50 -> XYZ_D60 -> AP1 (ACEScg)
+            float tmp[9];
+            float camToAcescg[9];
+            matMul(Bradford_D50_to_D60, params.forwardMatrix2, tmp);
+            matMul(XYZ_D60_to_AP1, tmp, camToAcescg);
+
+            // ACEScg -> output (BakedTransform matrix).
+            const float* bakedM = nullptr;
+            int curveCode = 0;  // matches BakedTransform.cpp Curve enum
+            switch (cs) {
+                case mcc::OutputColorSpace::ACEScg:
+                    bakedM = nullptr; curveCode = 0; break;
+                case mcc::OutputColorSpace::LinearRec709: {
+                    static const float M[9] = {
+                         1.7050514f, -0.6217908f, -0.0832606f,
+                        -0.1302561f,  1.1408047f, -0.0105486f,
+                        -0.0240083f, -0.1289693f,  1.1529777f,
+                    };
+                    bakedM = M; curveCode = 0; break;
+                }
+                case mcc::OutputColorSpace::ACES2065_1: {
+                    static const float M[9] = {
+                         0.6954522f,  0.1406787f,  0.1638691f,
+                         0.0447946f,  0.8596711f,  0.0955343f,
+                        -0.0055258f,  0.0040252f,  1.0015007f,
+                    };
+                    bakedM = M; curveCode = 0; break;
+                }
+                case mcc::OutputColorSpace::Rec709Gamma22: {
+                    static const float M[9] = {
+                         1.7050514f, -0.6217908f, -0.0832606f,
+                        -0.1302561f,  1.1408047f, -0.0105486f,
+                        -0.0240083f, -0.1289693f,  1.1529777f,
+                    };
+                    bakedM = M; curveCode = 1; break;
+                }
+                case mcc::OutputColorSpace::Rec709Display: {
+                    static const float M[9] = {
+                         1.7050514f, -0.6217908f, -0.0832606f,
+                        -0.1302561f,  1.1408047f, -0.0105486f,
+                        -0.0240083f, -0.1289693f,  1.1529777f,
+                    };
+                    bakedM = M; curveCode = 2; break;
+                }
+                case mcc::OutputColorSpace::SRGB: {
+                    static const float M[9] = {
+                         1.7050514f, -0.6217908f, -0.0832606f,
+                        -0.1302561f,  1.1408047f, -0.0105486f,
+                        -0.0240083f, -0.1289693f,  1.1529777f,
+                    };
+                    bakedM = M; curveCode = 3; break;
+                }
+                default:
+                    throw std::runtime_error("unreachable (non-baked target)");
+            }
+
+            float fullMatrix[9];
+            if (bakedM) {
+                matMul(bakedM, camToAcescg, fullMatrix);
+            } else {
+                std::memcpy(fullMatrix, camToAcescg, sizeof(fullMatrix));
+            }
+
+            // Build per-CFA-position constants. The CPU NormalizeBayer
+            // splits the channel mapping via CfaChannelMap; we replicate
+            // that here so the kernel gets {R,G,G,B} (or BGGR etc.).
+            int chMap[4];
+            int cfaToLsm[4];
+            switch (params.cfa) {
+                case mcc::CfaPattern::RGGB:
+                    chMap[0]=0; chMap[1]=1; chMap[2]=1; chMap[3]=2;
+                    cfaToLsm[0]=0; cfaToLsm[1]=1; cfaToLsm[2]=2; cfaToLsm[3]=3;
+                    break;
+                case mcc::CfaPattern::BGGR:
+                    chMap[0]=2; chMap[1]=1; chMap[2]=1; chMap[3]=0;
+                    cfaToLsm[0]=3; cfaToLsm[1]=2; cfaToLsm[2]=1; cfaToLsm[3]=0;
+                    break;
+                case mcc::CfaPattern::GRBG:
+                    chMap[0]=1; chMap[1]=0; chMap[2]=2; chMap[3]=1;
+                    cfaToLsm[0]=1; cfaToLsm[1]=0; cfaToLsm[2]=3; cfaToLsm[3]=2;
+                    break;
+                case mcc::CfaPattern::GBRG:
+                    chMap[0]=1; chMap[1]=2; chMap[2]=0; chMap[3]=1;
+                    cfaToLsm[0]=2; cfaToLsm[1]=3; cfaToLsm[2]=0; cfaToLsm[3]=1;
+                    break;
+            }
+
+            motioncam::cuda::BayerPipelineConstants C{};
+            std::memcpy(C.cam_to_output, fullMatrix, sizeof(fullMatrix));
+            for (int i = 0; i < 4; ++i) {
+                C.black[i] = params.blackPerPosition[i];
+                double denom = params.whiteLevel - double(params.blackPerPosition[i]);
+                C.inv_range[i] = denom > 0.0 ? float(1.0 / denom) : 0.0f;
+                C.cfa_channel[i] = chMap[i];
+                C.cfa_to_lsm[i]  = cfaToLsm[i];
+            }
+            C.curve  = curveCode;
+            C.width  = int(width);
+            C.height = int(height);
+            // Pass-through optional LSM. params.lensShadingMap is already
+            // flattened as 4 * lsmW * lsmH channel-first floats by
+            // BuildFrameParams — exactly what the kernel expects.
+            if (!params.lensShadingMap.empty() &&
+                params.lsmWidth >= 2 && params.lsmHeight >= 2) {
+                C.lsm_w    = int(params.lsmWidth);
+                C.lsm_h    = int(params.lsmHeight);
+                C.lsm_host = params.lensShadingMap.data();
+            } else {
+                C.lsm_w    = 0;
+                C.lsm_h    = 0;
+                C.lsm_host = nullptr;
+            }
+
+            // Allocate output array, run pipeline.
+            py::array_t<float> arr({ int(height), int(width), 3 });
+            {
+                py::gil_scoped_release release;
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
+                bool ok = motioncam::cuda::ProcessBayerToRgb(
+                    raw, params.asShotNeutral, C, arr.mutable_data());
+                if (!ok) {
+                    throw std::runtime_error("ProcessBayerToRgb kernel failed");
+                }
+            }
+            return arr;
+        },
+        py::arg("decoder"), py::arg("timestamp"), py::arg("target_colorspace"),
+        "Phase C.1 GPU bayer pipeline (normalise + debayer + cam-to-output "
+        "matrix + optional curve). Returns float32 (H, W, 3) RGB in the "
+        "target colour space. For correctness testing against process_frame.");
+#endif
 
     m.def("encoder_available", [](const std::string& name) -> bool {
         // Two-step check: codec compiled into FFmpeg, AND it can actually open
