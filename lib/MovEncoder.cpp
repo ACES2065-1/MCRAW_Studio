@@ -6,9 +6,15 @@ extern "C" {
 #include <libavutil/imgutils.h>
 #include <libavutil/opt.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 }
 
+#if MCRAW_HAVE_CUDA
+#include <motioncam/CudaHwHandoff.hpp>
+#endif
+
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -119,6 +125,16 @@ struct MovEncoder::Impl {
 
     AVPacket* pkt = nullptr;
     bool finalized = false;
+
+#if MCRAW_HAVE_CUDA
+    // CUDA upload path (Tier 2.1 Phase A.2). Opt-in via MCRAW_GPU_YUV=1 env
+    // var. When active, WriteVideoFrame uploads the CPU yuvFrame to a CUDA
+    // hwframe and sends that to NVENC instead — skips libavcodec's internal
+    // CPU->GPU copy. Phase B will replace the sws_scale CPU step itself.
+    AVBufferRef* hwDeviceCtx = nullptr;
+    AVBufferRef* hwFramesCtx = nullptr;
+    bool useCudaUpload = false;
+#endif
 };
 
 MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
@@ -313,6 +329,64 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
         p->videoCtx->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
     }
 
+#if MCRAW_HAVE_CUDA
+    // Tier 2.1 Phase A.2 — CUDA hwframe upload path. Opt-in via env var so
+    // we can A/B test against the CPU path during v0.2.0. We require:
+    //   1. The encoder is an NVENC variant (it actually consumes GPU surfaces)
+    //   2. CUDA is built into this binary AND a CUDA device is visible
+    //      (cuda::IsCudaAvailable does the device-count probe)
+    //   3. MCRAW_GPU_YUV=1 in the environment
+    // If any check fails we silently take the existing CPU YUV path.
+    {
+        const bool isNvencCodec =
+            venc->name && std::strstr(venc->name, "nvenc") != nullptr;
+        const char* envOpt = std::getenv("MCRAW_GPU_YUV");
+        const bool envOptIn = envOpt && std::strcmp(envOpt, "1") == 0;
+
+        if (isNvencCodec && envOptIn && motioncam::cuda::IsCudaAvailable()) {
+            int hwErr = av_hwdevice_ctx_create(&p->hwDeviceCtx,
+                AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
+            if (hwErr < 0) {
+                char buf[128]{};
+                av_strerror(hwErr, buf, sizeof(buf));
+                fprintf(stderr,
+                    "[MovEncoder] CUDA hwdevice init failed (%s); "
+                    "falling back to CPU YUV path.\n", buf);
+            } else {
+                AVBufferRef* framesRef = av_hwframe_ctx_alloc(p->hwDeviceCtx);
+                if (framesRef) {
+                    auto* fc = reinterpret_cast<AVHWFramesContext*>(framesRef->data);
+                    fc->format = AV_PIX_FMT_CUDA;
+                    fc->sw_format = p->videoCtx->pix_fmt;  // YUV420P or P010LE
+                    fc->width = s.width;
+                    fc->height = s.height;
+                    fc->initial_pool_size = 8;  // NVENC pipelines ~6 frames
+                    int initErr = av_hwframe_ctx_init(framesRef);
+                    if (initErr >= 0) {
+                        p->hwFramesCtx = framesRef;
+                        p->videoCtx->hw_frames_ctx = av_buffer_ref(p->hwFramesCtx);
+                        p->videoCtx->pix_fmt = AV_PIX_FMT_CUDA;
+                        p->useCudaUpload = true;
+                        fprintf(stderr,
+                            "[MovEncoder] CUDA hwupload path enabled "
+                            "(MCRAW_GPU_YUV=1).\n");
+                    } else {
+                        av_buffer_unref(&framesRef);
+                        char buf[128]{};
+                        av_strerror(initErr, buf, sizeof(buf));
+                        fprintf(stderr,
+                            "[MovEncoder] hwframes init failed (%s); "
+                            "falling back to CPU YUV path.\n", buf);
+                    }
+                }
+                if (!p->useCudaUpload && p->hwDeviceCtx) {
+                    av_buffer_unref(&p->hwDeviceCtx);
+                }
+            }
+        }
+    }
+#endif
+
     int err = avcodec_open2(p->videoCtx, venc, nullptr);
     if (err < 0) ThrowAv("avcodec_open2(video)", err);
 
@@ -321,7 +395,17 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
 
     p->yuvFrame = av_frame_alloc();
     if (!p->yuvFrame) Throw("av_frame_alloc(yuv) failed");
-    p->yuvFrame->format = p->videoCtx->pix_fmt;
+    // yuvFrame is the *CPU* staging buffer for sws_scale output. When the
+    // CUDA upload path is active, videoCtx->pix_fmt is AV_PIX_FMT_CUDA —
+    // we need to allocate yuvFrame with the underlying software format
+    // (recorded in hwFramesCtx->sw_format) instead.
+    AVPixelFormat yuvFormat = p->videoCtx->pix_fmt;
+#if MCRAW_HAVE_CUDA
+    if (p->useCudaUpload && p->hwFramesCtx) {
+        yuvFormat = reinterpret_cast<AVHWFramesContext*>(p->hwFramesCtx->data)->sw_format;
+    }
+#endif
+    p->yuvFrame->format = yuvFormat;
     p->yuvFrame->width = s.width;
     p->yuvFrame->height = s.height;
     err = av_frame_get_buffer(p->yuvFrame, 0);
@@ -389,9 +473,13 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
     err = avformat_write_header(p->fmt, nullptr);
     if (err < 0) ThrowAv("avformat_write_header", err);
 
+    // sws_scale runs on CPU and outputs the *software* YUV format; the
+    // CUDA path then uploads that to the GPU separately. So we use the
+    // same yuvFormat the yuvFrame was allocated with, not pix_fmt (which
+    // may be AV_PIX_FMT_CUDA on the GPU path).
     p->sws = sws_getContext(
         s.width, s.height, AV_PIX_FMT_GBRPF32LE,
-        s.width, s.height, p->videoCtx->pix_fmt,
+        s.width, s.height, yuvFormat,
         SWS_BICUBIC, nullptr, nullptr, nullptr);
     if (!p->sws) Throw("sws_getContext failed");
 
@@ -414,8 +502,14 @@ MovEncoder::~MovEncoder() {
     if (p->yuvFrame) av_frame_free(&p->yuvFrame);
     if (p->rgbStaging) av_frame_free(&p->rgbStaging);
     if (p->sws) sws_freeContext(p->sws);
+    // Destroy encoder first — it holds refs on hw_frames_ctx / hw_device_ctx
+    // and must be torn down before we unref those.
     if (p->videoCtx) avcodec_free_context(&p->videoCtx);
     if (p->audioCtx) avcodec_free_context(&p->audioCtx);
+#if MCRAW_HAVE_CUDA
+    if (p->hwFramesCtx) av_buffer_unref(&p->hwFramesCtx);
+    if (p->hwDeviceCtx) av_buffer_unref(&p->hwDeviceCtx);
+#endif
     if (p->pkt) av_packet_free(&p->pkt);
     if (p->fmt) {
         if (p->fmt->pb) avio_closep(&p->fmt->pb);
@@ -462,9 +556,40 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
         p->rgbStaging->data, p->rgbStaging->linesize, 0, h,
         p->yuvFrame->data, p->yuvFrame->linesize);
 
-    p->yuvFrame->pts = p->videoPts++;
+    AVFrame* frameToSend = p->yuvFrame;
 
-    err = avcodec_send_frame(p->videoCtx, p->yuvFrame);
+#if MCRAW_HAVE_CUDA
+    AVFrame* hwFrame = nullptr;
+    if (p->useCudaUpload) {
+        // Borrow a frame from the GPU pool. The pool was sized to 8 in
+        // setup; av_hwframe_get_buffer reuses slots if the previous frame
+        // has been released by NVENC.
+        hwFrame = av_frame_alloc();
+        if (!hwFrame) Throw("av_frame_alloc(hw) failed");
+        int hwErr = av_hwframe_get_buffer(p->hwFramesCtx, hwFrame, 0);
+        if (hwErr < 0) {
+            av_frame_free(&hwFrame);
+            ThrowAv("av_hwframe_get_buffer", hwErr);
+        }
+        // CPU YUV -> GPU YUV. This is the actual CPU->GPU copy. Phase A
+        // doesn't save anything yet vs libavcodec's internal upload, but
+        // it sets up the contract Phase B needs to skip sws_scale entirely.
+        hwErr = av_hwframe_transfer_data(hwFrame, p->yuvFrame, 0);
+        if (hwErr < 0) {
+            av_frame_free(&hwFrame);
+            ThrowAv("av_hwframe_transfer_data", hwErr);
+        }
+        frameToSend = hwFrame;
+    }
+#endif
+
+    frameToSend->pts = p->videoPts++;
+    err = avcodec_send_frame(p->videoCtx, frameToSend);
+
+#if MCRAW_HAVE_CUDA
+    if (hwFrame) av_frame_free(&hwFrame);
+#endif
+
     if (err < 0) ThrowAv("avcodec_send_frame(video)", err);
 
     while (true) {
