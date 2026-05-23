@@ -377,7 +377,7 @@ static void DoRender(
         // space has a BakedTransform. Falls back silently to the CPU
         // producer-consumer below otherwise.
         bool gpuBayerActive = false;
-        if (!highlight_recovery && !wantDenoise) {
+        if (!wantDenoise) {
             mcv::MovEncoder::GpuBayerSetup setup{};
             setup.targetColorSpace = static_cast<int>(cs);
             std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
@@ -388,6 +388,9 @@ static void DoRender(
             setup.cfaPattern = static_cast<int>(params0.cfa);
             // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
             setup.ocioColorSpace = csInfo.ocioName;
+            // Phase E.3: highlight recovery now runs on the GPU.
+            setup.highlightRecovery = highlight_recovery;
+            setup.displayEncoded    = mcc::IsDisplayEncoded(cs);
             gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
         }
 
@@ -756,7 +759,8 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
     // and verify they're equal within float epsilon.
     m.def("cuda_process_frame_phase_c",
         [](PyDecoder& pyDec, int64_t timestamp,
-           const std::string& target_colorspace) -> py::array_t<float> {
+           const std::string& target_colorspace,
+           bool highlight_recovery) -> py::array_t<float> {
             mc::Decoder& dec = *pyDec.underlying();
 
             // Map the target colorspace to a (matrix, curve) plan.
@@ -914,6 +918,8 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
             C.curve  = curveCode;
             C.width  = int(width);
             C.height = int(height);
+            C.highlight_recovery = highlight_recovery ? 1 : 0;
+            C.highlight_rolloff  = (highlight_recovery && mcc::IsDisplayEncoded(cs)) ? 1 : 0;
             // Pass-through optional LSM. params.lensShadingMap is already
             // flattened as 4 * lsmW * lsmH channel-first floats by
             // BuildFrameParams — exactly what the kernel expects.
@@ -942,9 +948,11 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
             return arr;
         },
         py::arg("decoder"), py::arg("timestamp"), py::arg("target_colorspace"),
+        py::arg("highlight_recovery") = false,
         "Phase C.1 GPU bayer pipeline (normalise + debayer + cam-to-output "
-        "matrix + optional curve). Returns float32 (H, W, 3) RGB in the "
-        "target colour space. For correctness testing against process_frame.");
+        "matrix + optional curve, + optional highlight recovery/rolloff). "
+        "Returns float32 (H, W, 3) RGB in the target colour space. For "
+        "correctness testing against process_frame.");
 
     // Phase D correctness test. Runs the GPU bayer pipeline with the OCIO
     // 3D-LUT step (normalise + debayer + cam->ACEScg matrix + asinh-shaped

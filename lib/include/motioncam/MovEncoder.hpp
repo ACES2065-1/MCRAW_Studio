@@ -114,6 +114,14 @@ public:
         // empty name on a non-baked target makes EnableGpuBayerPipeline
         // fall back to the CPU pipeline.
         std::string ocioColorSpace;
+
+        // Phase E.3: highlight handling on the GPU (matches ColorPipeline).
+        // highlightRecovery enables the pre-matrix NeutraliseClippedHighlights
+        // pass; displayEncoded (= IsDisplayEncoded(target)) additionally
+        // enables the post-transform 1.0->1.4 rolloff. With these set the GPU
+        // path no longer has to be skipped for highlight-recovery renders.
+        bool highlightRecovery = false;
+        bool displayEncoded    = false;
     };
 
     bool EnableGpuBayerPipeline(const GpuBayerSetup& setup);

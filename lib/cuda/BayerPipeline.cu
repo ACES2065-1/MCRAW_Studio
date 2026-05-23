@@ -399,6 +399,83 @@ __global__ void ApplyLut3DKernel(
 }
 
 // ============================================================================
+// Kernel 5 (Phase E.3): NeutraliseClippedHighlights  -  pre-matrix de-magenta
+// (matches Debayer.cpp::NeutraliseClippedHighlights; cam-RGB, WB-applied)
+// ============================================================================
+
+__global__ void NeutraliseClippedHighlightsKernel(
+    float* __restrict__ rgb,
+    int width, int height,
+    float wb0, float wb1, float wb2)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const size_t o = (size_t(y) * size_t(width) + size_t(x)) * 3;
+    const float r = rgb[o + 0];
+    const float g = rgb[o + 1];
+    const float b = rgb[o + 2];
+
+    const float rn = r * wb0;
+    const float gn = g * wb1;
+    const float bn = b * wb2;
+    const float maxN = fmaxf(rn, fmaxf(gn, bn));
+    const float minN = fminf(rn, fminf(gn, bn));
+
+    float t_max = (maxN - 0.5f) * 2.0f;           // smoothstep(0.5, 1.0, maxN)
+    if (t_max <= 0.0f) return;
+    if (t_max > 1.0f) t_max = 1.0f;
+    t_max = t_max * t_max * (3.0f - 2.0f * t_max);
+
+    float t_gate = (minN - 0.2f) * 5.0f;          // smoothstep(0.2, 0.4, minN)
+    if (t_gate <= 0.0f) return;
+    if (t_gate > 1.0f) t_gate = 1.0f;
+    t_gate = t_gate * t_gate * (3.0f - 2.0f * t_gate);
+
+    const float t = t_max * t_gate;
+    const float maxCh = fmaxf(r, fmaxf(g, b));
+    rgb[o + 0] = r + (maxCh - r) * t;
+    rgb[o + 1] = g + (maxCh - g) * t;
+    rgb[o + 2] = b + (maxCh - b) * t;
+}
+
+// ============================================================================
+// Kernel 6 (Phase E.3): HighlightRolloff  -  post-transform shoulder
+// (matches Debayer.cpp::HighlightRolloff; display-encoded outputs only)
+// ============================================================================
+
+__global__ void HighlightRolloffKernel(
+    float* __restrict__ rgb,
+    int width, int height,
+    float kneeStart, float kneeEnd, float invKneeRange)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const size_t o = (size_t(y) * size_t(width) + size_t(x)) * 3;
+    float r = rgb[o + 0];
+    float g = rgb[o + 1];
+    float b = rgb[o + 2];
+    const float maxCh = fmaxf(r, fmaxf(g, b));
+    if (maxCh <= kneeStart) return;
+
+    float t = (maxCh - kneeStart) * invKneeRange;
+    if (t < 0.0f) t = 0.0f; else if (t > 1.0f) t = 1.0f;
+    t = t * t * (3.0f - 2.0f * t);
+    r = r + (maxCh - r) * t;
+    g = g + (maxCh - g) * t;
+    b = b + (maxCh - b) * t;
+    if (r > kneeEnd) r = kneeEnd;
+    if (g > kneeEnd) g = kneeEnd;
+    if (b > kneeEnd) b = kneeEnd;
+    rgb[o + 0] = r;
+    rgb[o + 1] = g;
+    rgb[o + 2] = b;
+}
+
+// ============================================================================
 // Kernel 1b: ApplyLensShading  -  per-pixel bilinear LSM gain multiply
 // (matches Debayer.cpp::ApplyLensShading; same channel-first layout)
 //
@@ -538,6 +615,13 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
         C.cfa_channel[2], C.cfa_channel[3]);
     if (cudaGetLastError() != cudaSuccess) return false;
 
+    // Phase E.3: pre-matrix highlight recovery (cam-RGB, WB-applied).
+    if (C.highlight_recovery) {
+        NeutraliseClippedHighlightsKernel<<<grid, block>>>(
+            gRgbFloat, W, H, wb[0], wb[1], wb[2]);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+
     ApplyMatrixCurveKernel<<<grid, block>>>(
         gRgbFloat, W, H,
         C.cam_to_output[0], C.cam_to_output[1], C.cam_to_output[2],
@@ -547,7 +631,16 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
     if (cudaGetLastError() != cudaSuccess) return false;
 
     // Phase D: optional ACEScg->target 3D LUT (OCIO targets).
-    return MaybeApplyLut3D(C, W, H, grid, block);
+    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
+
+    // Phase E.3: post-transform highlight rolloff (display-encoded targets).
+    if (C.highlight_recovery && C.highlight_rolloff) {
+        const float kneeStart = 1.0f, kneeEnd = 1.4f;
+        HighlightRolloffKernel<<<grid, block>>>(
+            gRgbFloat, W, H, kneeStart, kneeEnd, 1.0f / (kneeEnd - kneeStart));
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+    return true;
 }
 }  // namespace
 

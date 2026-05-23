@@ -1025,6 +1025,8 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
     C.width     = p->settings.width;
     C.height    = p->settings.height;
     C.use_lut3d = useLut ? 1 : 0;
+    C.highlight_recovery = setup.highlightRecovery ? 1 : 0;
+    C.highlight_rolloff  = (setup.highlightRecovery && setup.displayEncoded) ? 1 : 0;
     C.lsm_w  = 0;
     C.lsm_h  = 0;
     C.lsm_host = nullptr;

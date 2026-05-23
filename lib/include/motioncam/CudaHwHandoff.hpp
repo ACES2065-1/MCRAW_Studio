@@ -127,6 +127,14 @@ struct BayerPipelineConstants {
     // Requires a prior successful SetupLut3D(). Ignored if no LUT is loaded.
     int      use_lut3d = 0;
 
+    // Phase E.3: highlight handling (matches ColorPipeline.cpp). When
+    // highlight_recovery is non-zero, NeutraliseClippedHighlights runs in
+    // cam-RGB right after debayer (using the per-frame wb). When
+    // highlight_rolloff is also non-zero (display-encoded targets), a
+    // 1.0->1.4 knee rolloff runs at the very end, after the matrix/LUT.
+    int      highlight_recovery = 0;
+    int      highlight_rolloff  = 0;
+
     // Optional lens-shading map. If lsm_w > 0 && lsm_h > 0 && lsm_host is
     // non-null, the kernel multiplies each bayer pixel by the bilinearly
     // sampled gain from lsm_host[cfa_to_lsm[idx]] grid. lsm_host points to

@@ -298,7 +298,7 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     // colour space has a BakedTransform — enable the full GPU bayer pipeline.
     // Falls back silently to the CPU producer-consumer below otherwise.
     bool gpuBayerActive = false;
-    if (!args.highlightRecovery && !wantDenoise) {
+    if (!wantDenoise) {
         motioncam::video::MovEncoder::GpuBayerSetup setup{};
         setup.targetColorSpace = static_cast<int>(args.colorSpace);
         std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
@@ -309,6 +309,10 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
         setup.cfaPattern = static_cast<int>(params0.cfa);
         // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
         setup.ocioColorSpace = csInfo.ocioName;
+        // Phase E.3: highlight recovery now runs on the GPU, so it no longer
+        // forces the CPU pipeline.
+        setup.highlightRecovery = args.highlightRecovery;
+        setup.displayEncoded    = motioncam::color::IsDisplayEncoded(args.colorSpace);
         gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
     }
 

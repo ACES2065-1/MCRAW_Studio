@@ -210,6 +210,15 @@ CASES = [
          expect_streams=["video", "audio"],
          colorspace="acescg", codec="h265_nvenc", start=0, end=8, bitrate=60,
          ten_bit=True),
+
+    # Highlight recovery via NVENC — exercises the Phase E.3 GPU highlight
+    # kernels when MCRAW_GPU_YUV=1 (the libx264 recovery case above stays on
+    # the CPU regardless).
+    Case("mp4_h265nvenc_srgb_recovery",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="srgb", codec="h265_nvenc", start=0, end=8, bitrate=40,
+         highlight_recovery=True),
 ]
 
 
