@@ -219,6 +219,14 @@ CASES = [
          expect_streams=["video", "audio"],
          colorspace="srgb", codec="h265_nvenc", start=0, end=8, bitrate=40,
          highlight_recovery=True),
+
+    # Rec.2020 PQ HDR via NVENC — exercises the Phase E.2 GPU BT.2020 matrix
+    # (+ Phase D LUT + P010) when MCRAW_GPU_YUV=1. 10-bit Main10.
+    Case("mp4_h265nvenc_rec2020pq",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="rec2020-pq", codec="h265_nvenc", start=0, end=8,
+         bitrate=60, ten_bit=True),
 ]
 
 

@@ -53,6 +53,8 @@ bool RunPhaseAProbe();
 //
 // Returns false if any CUDA call fails (e.g. OOM, kernel launch error);
 // caller is expected to fall back to the CPU YUV path in that case.
+// yuv_matrix selects the RGB->Y'CbCr matrix: 0 = BT.709, 1 = BT.2020 NCL
+// (for Rec.2020 PQ/HLG delivery). Limited range either way.
 bool RgbFloatToNv12(
     const float* rgb_host,
     void* y_device,
@@ -60,7 +62,8 @@ bool RgbFloatToNv12(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes);
+    int   uv_pitch_bytes,
+    int   yuv_matrix = 0);
 
 // Release the lazily-allocated device scratch buffer. Call this once at
 // MovEncoder destruction so the GPU memory isn't held for the lifetime
@@ -78,14 +81,15 @@ bool RgbFloatToNv12FromDevice(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes);
+    int   uv_pitch_bytes,
+    int   yuv_matrix = 0);
 
-// ---------- Phase E.1: RGB float -> P010 (BT.709 limited, 10-bit) -------
+// ---------- Phase E.1: RGB float -> P010 (10-bit) -----------------------
 //
 // 10-bit siblings of the NV12 converters. Output is P010: 16-bit samples
 // with the 10-bit value in the high bits (value << 6), Y plane + interleaved
-// UV, 4:2:0, BT.709 limited range. y_device / uv_device are the P010 hwframe
-// planes (AVFrame data[0/1]); pitches are linesize[0/1] in bytes.
+// UV, 4:2:0, limited range. y_device / uv_device are the P010 hwframe planes
+// (AVFrame data[0/1]); pitches are linesize[0/1] in bytes. yuv_matrix as above.
 bool RgbFloatToP010(
     const float* rgb_host,
     void* y_device,
@@ -93,7 +97,8 @@ bool RgbFloatToP010(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes);
+    int   uv_pitch_bytes,
+    int   yuv_matrix = 0);
 
 bool RgbFloatToP010FromDevice(
     const void* rgb_device,
@@ -102,7 +107,8 @@ bool RgbFloatToP010FromDevice(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes);
+    int   uv_pitch_bytes,
+    int   yuv_matrix = 0);
 
 // ---------- Phase C: bayer -> RGB on GPU --------------------------------
 //
@@ -134,6 +140,10 @@ struct BayerPipelineConstants {
     // 1.0->1.4 knee rolloff runs at the very end, after the matrix/LUT.
     int      highlight_recovery = 0;
     int      highlight_rolloff  = 0;
+
+    // Phase E.2: RGB->Y'CbCr matrix for the final NV12/P010 step.
+    // 0 = BT.709, 1 = BT.2020 NCL (Rec.2020 PQ/HLG delivery).
+    int      yuv_matrix = 0;
 
     // Optional lens-shading map. If lsm_w > 0 && lsm_h > 0 && lsm_host is
     // non-null, the kernel multiplies each bayer pixel by the bilinearly

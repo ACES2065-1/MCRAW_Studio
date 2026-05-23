@@ -144,6 +144,9 @@ struct MovEncoder::Impl {
     // Phase E.1: true when the hwframe is 10-bit P010 (vs 8-bit NV12). The
     // RGB->YUV step then uses the P010 kernel.
     bool useCudaP010 = false;
+    // Phase E.2: true when the RGB->Y'CbCr step uses the BT.2020 NCL matrix
+    // (Rec.2020 PQ/HLG delivery) instead of BT.709.
+    bool useCudaBt2020 = false;
 
     // Phase C.2 state. When useGpuBayerPipeline is true the caller passes
     // bayer + WB + LSM via WriteVideoFrameFromBayer and the encoder runs
@@ -338,9 +341,24 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
     // QuickTime 'nclc' color tag — caller supplies primaries / transfer / matrix
     // matching the encoded values. Resolve and friends use this to pick the input
     // transform automatically on import.
+    //
+    // matrix_coefficients describes the RGB<->Y'CbCr conversion, which our
+    // kernels (and the pinned sws path below) perform as BT.709 for everything
+    // except Rec.2020 (BT.2020 NCL). For subsampled YUV deliverables we never
+    // emit UNSPECIFIED: a file tagged "unspecified" makes After Effects' HEVC
+    // decoder fail to reconstruct RGB (solid-green frames). primaries / transfer
+    // still come from the colour space (they describe the RGB container).
+    const bool isYuvDelivery =
+        s.codec == Codec::H264      || s.codec == Codec::H265 ||
+        s.codec == Codec::H264NVENC || s.codec == Codec::H265NVENC ||
+        s.codec == Codec::AV1NVENC;
+    int effMatrix = s.colorMatrix;
+    if (isYuvDelivery && effMatrix != 9) effMatrix = 1;  // BT.709 (incl. unspecified)
+
     p->videoCtx->color_primaries = static_cast<AVColorPrimaries>(s.colorPrimaries);
     p->videoCtx->color_trc       = static_cast<AVColorTransferCharacteristic>(s.colorTrc);
-    p->videoCtx->colorspace      = static_cast<AVColorSpace>(s.colorMatrix);
+    p->videoCtx->colorspace      = static_cast<AVColorSpace>(
+        isYuvDelivery ? effMatrix : s.colorMatrix);
     p->videoCtx->color_range     = AVCOL_RANGE_MPEG;
 
     if (p->fmt->oformat->flags & AVFMT_GLOBALHEADER) {
@@ -363,18 +381,17 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
 
         if (isNvencCodec && envOptIn && motioncam::cuda::IsCudaAvailable()) {
             // Kernel-supported check. The RGB->YUV kernels handle 8-bit NV12
-            // and 10-bit P010, both BT.709 limited. The BT.2020 NCL matrix
-            // (Rec.2020 PQ/HLG delivery) still keeps the CPU YUV pipeline
-            // until Phase E.2.
+            // and 10-bit P010, with either the BT.709 or BT.2020 NCL matrix
+            // (so Rec.2020 PQ/HLG delivery is covered too).
             const bool is8bit  = (p->videoCtx->pix_fmt == AV_PIX_FMT_YUV420P);
             const bool is10bit = (p->videoCtx->pix_fmt == AV_PIX_FMT_P010LE);
-            const bool bt709Compat = (s.colorMatrix == 1 || s.colorMatrix == 2);
-            if ((!is8bit && !is10bit) || !bt709Compat) {
+            const bool matrixSupported = (effMatrix == 1 || effMatrix == 9);
+            if ((!is8bit && !is10bit) || !matrixSupported) {
                 fprintf(stderr,
                     "[MovEncoder] CUDA path requested but output is "
                     "%s%s — using CPU YUV.\n",
                     (!is8bit && !is10bit) ? "an unsupported pixel format" : "",
-                    !bt709Compat ? " / BT.2020 matrix" : "");
+                    !matrixSupported ? " / unsupported matrix" : "");
             } else {
                 int hwErr = av_hwdevice_ctx_create(&p->hwDeviceCtx,
                     AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -404,11 +421,13 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
                             p->useCudaUpload = true;
                             p->useCudaDirectKernel = true;
                             p->useCudaP010 = is10bit;
+                            p->useCudaBt2020 = (effMatrix == 9);
                             fprintf(stderr,
                                 "[MovEncoder] CUDA RGB->%s kernel "
-                                "(Phase B%s) enabled.\n",
+                                "(Phase B%s, %s) enabled.\n",
                                 is10bit ? "P010" : "NV12",
-                                is10bit ? "/E.1" : "");
+                                is10bit ? "/E.1" : "",
+                                (effMatrix == 9) ? "BT.2020" : "BT.709");
                         } else {
                             av_buffer_unref(&framesRef);
                             char buf[128]{};
@@ -523,6 +542,23 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
         SWS_BICUBIC, nullptr, nullptr, nullptr);
     if (!p->sws) Throw("sws_getContext failed");
 
+    // Pin the CPU RGB->Y'CbCr matrix to match the file's tag and the GPU
+    // kernels. libswscale otherwise defaults to BT.601 coefficients, which
+    // would (a) disagree with the BT.709/BT.2020 matrix we tag the file with
+    // and (b) make the CPU and GPU paths produce different YCbCr. Only the
+    // subsampled YUV deliverables go through this matrix; ProRes / DNxHR /
+    // CineForm keep libswscale's defaults. RGB input is full-range, the YUV
+    // output limited-range.
+    if (isYuvDelivery) {
+        const int csCoef = (effMatrix == 9) ? SWS_CS_BT2020 : SWS_CS_ITU709;
+        const int* coeff = sws_getCoefficients(csCoef);
+        int srcRange = 1;  // GBRPF32 RGB is full range
+        int dstRange = 0;  // limited-range YUV
+        int brightness = 0, contrast = 1 << 16, saturation = 1 << 16;
+        sws_setColorspaceDetails(p->sws, coeff, srcRange, coeff, dstRange,
+                                 brightness, contrast, saturation);
+    }
+
     p->rgbStaging = av_frame_alloc();
     if (!p->rgbStaging) Throw("av_frame_alloc(rgb staging) failed");
     p->rgbStaging->format = AV_PIX_FMT_GBRPF32LE;
@@ -588,13 +624,14 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
             av_frame_free(&hwFrame);
             ThrowAv("av_hwframe_get_buffer", hwErr);
         }
+        const int yuvMatrix = p->useCudaBt2020 ? 1 : 0;
         const bool ok = p->useCudaP010
             ? motioncam::cuda::RgbFloatToP010(
                 rgb, hwFrame->data[0], hwFrame->data[1],
-                w, h, hwFrame->linesize[0], hwFrame->linesize[1])
+                w, h, hwFrame->linesize[0], hwFrame->linesize[1], yuvMatrix)
             : motioncam::cuda::RgbFloatToNv12(
                 rgb, hwFrame->data[0], hwFrame->data[1],
-                w, h, hwFrame->linesize[0], hwFrame->linesize[1]);
+                w, h, hwFrame->linesize[0], hwFrame->linesize[1], yuvMatrix);
         if (!ok) {
             av_frame_free(&hwFrame);
             Throw(p->useCudaP010 ? "RgbFloatToP010 kernel failed"
@@ -1027,6 +1064,7 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
     C.use_lut3d = useLut ? 1 : 0;
     C.highlight_recovery = setup.highlightRecovery ? 1 : 0;
     C.highlight_rolloff  = (setup.highlightRecovery && setup.displayEncoded) ? 1 : 0;
+    C.yuv_matrix = p->useCudaBt2020 ? 1 : 0;
     C.lsm_w  = 0;
     C.lsm_h  = 0;
     C.lsm_host = nullptr;

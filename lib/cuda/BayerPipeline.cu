@@ -691,7 +691,7 @@ bool ProcessBayerToNv12(
 
     return RgbFloatToNv12FromDevice(
         gRgbFloat, y_device, uv_device, W, H,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, C.yuv_matrix);
 }
 
 bool ProcessBayerToP010(
@@ -716,7 +716,7 @@ bool ProcessBayerToP010(
 
     return RgbFloatToP010FromDevice(
         gRgbFloat, y_device, uv_device, W, H,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, C.yuv_matrix);
 }
 
 }

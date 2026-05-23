@@ -128,6 +128,26 @@ __device__ __forceinline__ uint8_t ClampToByte(float x) {
     return static_cast<uint8_t>(x + 0.5f);
 }
 
+// RGB [0,1] -> normalised Y'CbCr (Y in [0,1], Cb/Cr in [-0.5,0.5]). Selects
+// BT.709 (useBt2020 == 0) or BT.2020 NCL (useBt2020 != 0) luma coefficients;
+// the chroma rows are the standard (B-Y)/(2(1-Kb)), (R-Y)/(2(1-Kr)) for each.
+// The limited-range byte/word scaling is the same for both and is applied by
+// the caller.
+__device__ __forceinline__ void RgbToYCbCr(
+    float R, float G, float B, int useBt2020,
+    float& Y, float& Cb, float& Cr)
+{
+    if (useBt2020) {
+        Y  =  0.2627f   * R + 0.6780f   * G + 0.0593f   * B;
+        Cb = -0.139630f * R - 0.360370f * G + 0.5f      * B;
+        Cr =  0.5f      * R - 0.459786f * G - 0.040214f * B;
+    } else {
+        Y  =  0.2126f   * R + 0.7152f   * G + 0.0722f   * B;
+        Cb = -0.114572f * R - 0.385428f * G + 0.5f      * B;
+        Cr =  0.5f      * R - 0.454153f * G - 0.045847f * B;
+    }
+}
+
 // One thread per Y pixel. Threads where (x even, y even) additionally
 // write one chroma sample (averaging the 2x2 block of RGB above each UV
 // position). Could be split into two grids — single-grid is simpler
@@ -137,25 +157,23 @@ __global__ void RgbFloatToNv12Kernel(
     uint8_t*     __restrict__ yPlane,
     uint8_t*     __restrict__ uvPlane,
     int width, int height,
-    int yPitch, int uvPitch)
+    int yPitch, int uvPitch,
+    int useBt2020)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= width || y >= height) return;
 
     const float* px = rgb + (size_t(y) * size_t(width) + size_t(x)) * 3;
-    float R = px[0];
-    float G = px[1];
-    float B = px[2];
-    // Clamp to [0,1] BEFORE the BT.709 multiply so out-of-gamut HDR values
-    // don't blow past 235.
-    R = __saturatef(R);
-    G = __saturatef(G);
-    B = __saturatef(B);
+    // Clamp to [0,1] BEFORE the matrix so out-of-gamut HDR values don't
+    // blow past 235.
+    float R = __saturatef(px[0]);
+    float G = __saturatef(px[1]);
+    float B = __saturatef(px[2]);
 
-    float Y_full =  0.2126f * R + 0.7152f * G + 0.0722f * B;
-    float Y_byte = Y_full * 219.0f + 16.0f;
-    yPlane[size_t(y) * size_t(yPitch) + size_t(x)] = ClampToByte(Y_byte);
+    float Y, Cb, Cr;
+    RgbToYCbCr(R, G, B, useBt2020, Y, Cb, Cr);
+    yPlane[size_t(y) * size_t(yPitch) + size_t(x)] = ClampToByte(Y * 219.0f + 16.0f);
 
     // One UV sample per 2x2 block. Only the top-left thread of each block
     // averages and stores; cuts the chroma work to 1/4.
@@ -166,23 +184,18 @@ __global__ void RgbFloatToNv12Kernel(
         const float* p01 = rgb + (size_t(y    ) * size_t(width) + size_t(yx2 )) * 3;
         const float* p10 = rgb + (size_t(yy2  ) * size_t(width) + size_t(x   )) * 3;
         const float* p11 = rgb + (size_t(yy2  ) * size_t(width) + size_t(yx2 )) * 3;
-        float Ra = (p00[0] + p01[0] + p10[0] + p11[0]) * 0.25f;
-        float Ga = (p00[1] + p01[1] + p10[1] + p11[1]) * 0.25f;
-        float Ba = (p00[2] + p01[2] + p10[2] + p11[2]) * 0.25f;
-        Ra = __saturatef(Ra);
-        Ga = __saturatef(Ga);
-        Ba = __saturatef(Ba);
+        float Ra = __saturatef((p00[0] + p01[0] + p10[0] + p11[0]) * 0.25f);
+        float Ga = __saturatef((p00[1] + p01[1] + p10[1] + p11[1]) * 0.25f);
+        float Ba = __saturatef((p00[2] + p01[2] + p10[2] + p11[2]) * 0.25f);
 
-        float Cb = -0.114572f * Ra - 0.385428f * Ga + 0.5f       * Ba;
-        float Cr =  0.5f       * Ra - 0.454153f * Ga - 0.045847f * Ba;
-        float Cb_byte = Cb * 224.0f + 128.0f;
-        float Cr_byte = Cr * 224.0f + 128.0f;
+        float Ya, Cba, Cra;
+        RgbToYCbCr(Ra, Ga, Ba, useBt2020, Ya, Cba, Cra);
 
         const int uvx = x >> 1;
         const int uvy = y >> 1;
         uint8_t* uvRow = uvPlane + size_t(uvy) * size_t(uvPitch);
-        uvRow[uvx * 2 + 0] = ClampToByte(Cb_byte);
-        uvRow[uvx * 2 + 1] = ClampToByte(Cr_byte);
+        uvRow[uvx * 2 + 0] = ClampToByte(Cba * 224.0f + 128.0f);
+        uvRow[uvx * 2 + 1] = ClampToByte(Cra * 224.0f + 128.0f);
     }
 }
 
@@ -211,7 +224,8 @@ __global__ void RgbFloatToP010Kernel(
     uint8_t*     __restrict__ yPlaneBytes,   // byte base, pitch in bytes
     uint8_t*     __restrict__ uvPlaneBytes,
     int width, int height,
-    int yPitch, int uvPitch)
+    int yPitch, int uvPitch,
+    int useBt2020)
 {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -222,10 +236,10 @@ __global__ void RgbFloatToP010Kernel(
     float G = __saturatef(px[1]);
     float B = __saturatef(px[2]);
 
-    const float Y_full = 0.2126f * R + 0.7152f * G + 0.0722f * B;
-    const float Y10    = Y_full * 876.0f + 64.0f;
+    float Y, Cb, Cr;
+    RgbToYCbCr(R, G, B, useBt2020, Y, Cb, Cr);
     uint16_t* yRow = reinterpret_cast<uint16_t*>(yPlaneBytes + size_t(y) * size_t(yPitch));
-    yRow[x] = ClampTo10Shifted(Y10);
+    yRow[x] = ClampTo10Shifted(Y * 876.0f + 64.0f);
 
     if ((x & 1) == 0 && (y & 1) == 0) {
         const int yx2 = (x + 1 < width)  ? x + 1 : x;
@@ -238,16 +252,14 @@ __global__ void RgbFloatToP010Kernel(
         float Ga = __saturatef((p00[1] + p01[1] + p10[1] + p11[1]) * 0.25f);
         float Ba = __saturatef((p00[2] + p01[2] + p10[2] + p11[2]) * 0.25f);
 
-        const float Cb = -0.114572f * Ra - 0.385428f * Ga + 0.5f      * Ba;
-        const float Cr =  0.5f      * Ra - 0.454153f * Ga - 0.045847f * Ba;
-        const float Cb10 = Cb * 896.0f + 512.0f;
-        const float Cr10 = Cr * 896.0f + 512.0f;
+        float Ya, Cba, Cra;
+        RgbToYCbCr(Ra, Ga, Ba, useBt2020, Ya, Cba, Cra);
 
         const int uvx = x >> 1;
         const int uvy = y >> 1;
         uint16_t* uvRow = reinterpret_cast<uint16_t*>(uvPlaneBytes + size_t(uvy) * size_t(uvPitch));
-        uvRow[uvx * 2 + 0] = ClampTo10Shifted(Cb10);
-        uvRow[uvx * 2 + 1] = ClampTo10Shifted(Cr10);
+        uvRow[uvx * 2 + 0] = ClampTo10Shifted(Cba * 896.0f + 512.0f);
+        uvRow[uvx * 2 + 1] = ClampTo10Shifted(Cra * 896.0f + 512.0f);
     }
 }
 
@@ -260,7 +272,8 @@ bool RgbFloatToNv12(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes)
+    int   uv_pitch_bytes,
+    int   yuv_matrix)
 {
     if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
     if (!rgb_host || !y_device || !uv_device) return false;
@@ -286,7 +299,7 @@ bool RgbFloatToNv12(
         static_cast<uint8_t*>(y_device),
         static_cast<uint8_t*>(uv_device),
         width, height,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, yuv_matrix);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) return false;
@@ -311,7 +324,8 @@ bool RgbFloatToNv12FromDevice(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes)
+    int   uv_pitch_bytes,
+    int   yuv_matrix)
 {
     // Same kernel, same block geometry — only difference is the input is
     // already on the device, so we skip the cudaMemcpyAsync that
@@ -328,7 +342,7 @@ bool RgbFloatToNv12FromDevice(
         static_cast<uint8_t*>(y_device),
         static_cast<uint8_t*>(uv_device),
         width, height,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, yuv_matrix);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return false;
@@ -345,7 +359,8 @@ bool RgbFloatToP010(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes)
+    int   uv_pitch_bytes,
+    int   yuv_matrix)
 {
     if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
     if (!rgb_host || !y_device || !uv_device) return false;
@@ -369,7 +384,7 @@ bool RgbFloatToP010(
         static_cast<uint8_t*>(y_device),
         static_cast<uint8_t*>(uv_device),
         width, height,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, yuv_matrix);
 
     err = cudaGetLastError();
     if (err != cudaSuccess) return false;
@@ -384,7 +399,8 @@ bool RgbFloatToP010FromDevice(
     int   width,
     int   height,
     int   y_pitch_bytes,
-    int   uv_pitch_bytes)
+    int   uv_pitch_bytes,
+    int   yuv_matrix)
 {
     if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
     if (!rgb_device || !y_device || !uv_device) return false;
@@ -398,7 +414,7 @@ bool RgbFloatToP010FromDevice(
         static_cast<uint8_t*>(y_device),
         static_cast<uint8_t*>(uv_device),
         width, height,
-        y_pitch_bytes, uv_pitch_bytes);
+        y_pitch_bytes, uv_pitch_bytes, yuv_matrix);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) return false;
