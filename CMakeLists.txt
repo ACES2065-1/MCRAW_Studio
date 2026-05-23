@@ -105,6 +105,7 @@ if (MCRAW_BUILD_RENDER)
         lib/Debayer.cpp
         lib/Denoise.cpp
         lib/ExrWriter.cpp
+        lib/FrameTiming.cpp
         lib/OcioTransform.cpp
         lib/MovEncoder.cpp
     )

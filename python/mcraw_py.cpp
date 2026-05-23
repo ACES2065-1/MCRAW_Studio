@@ -9,6 +9,7 @@
 #include <motioncam/ExrWriter.hpp>
 #include <motioncam/OcioTransform.hpp>
 #include <motioncam/MovEncoder.hpp>
+#include <motioncam/FrameTiming.hpp>
 #include <motioncam/Trimmer.hpp>
 
 #if MCRAW_HAVE_CUDA
@@ -73,20 +74,6 @@ bool EndsWithExt(const std::string& s, const std::string& ext) {
 bool EndsWithMov(const std::string& s) { return EndsWithExt(s, ".mov"); }
 bool EndsWithMp4(const std::string& s) { return EndsWithExt(s, ".mp4"); }
 
-void EstimateFps(const std::vector<mc::Timestamp>& frames, int& fpsNum, int& fpsDen) {
-    fpsNum = 30; fpsDen = 1;
-    if (frames.size() < 2) return;
-    const int64_t totalNs = frames.back() - frames.front();
-    if (totalNs <= 0) return;
-    const double avgPeriodNs = double(totalNs) / double(frames.size() - 1);
-    const double fps = 1.0e9 / avgPeriodNs;
-    auto near = [&](double t) { return std::abs(fps - t) < 0.05; };
-    if      (near(23.976)) { fpsNum = 24000; fpsDen = 1001; }
-    else if (near(29.97))  { fpsNum = 30000; fpsDen = 1001; }
-    else if (near(59.94))  { fpsNum = 60000; fpsDen = 1001; }
-    else                    { fpsNum = int(fps + 0.5); fpsDen = 1; }
-}
-
 }
 
 class PyDecoder {
@@ -121,7 +108,7 @@ public:
     }
 
     py::array_t<float> process_frame(int64_t timestamp, const std::string& colorspace,
-                                     bool highlight_recovery) {
+                                     bool highlight_recovery, bool bake_vignette) {
         mcc::OutputColorSpace cs;
         if (!mcc::ParseOutputColorSpace(colorspace, cs)) {
             throw std::runtime_error("unknown colorspace: " + colorspace);
@@ -138,7 +125,7 @@ public:
             width = params.width;
             height = params.height;
             const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
-            mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery);
+            mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery, bake_vignette);
 
             EnsureXform(cs);
             cachedXform_.Apply(rgbOut.data(), width, height);
@@ -156,7 +143,7 @@ public:
     // packed bytes, height, width). Lets callers (e.g. PyInstaller bundles that
     // don't ship numpy) build a QImage directly without importing numpy.
     py::tuple process_frame_rgb24(int64_t timestamp, const std::string& colorspace,
-                                  bool highlight_recovery) {
+                                  bool highlight_recovery, bool bake_vignette) {
         mcc::OutputColorSpace cs;
         if (!mcc::ParseOutputColorSpace(colorspace, cs))
             throw std::runtime_error("unknown color space: " + colorspace);
@@ -173,7 +160,7 @@ public:
             width = params.width;
             height = params.height;
             const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
-            mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery);
+            mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery, bake_vignette);
 
             EnsureXform(cs);
             cachedXform_.Apply(rgbOut.data(), width, height);
@@ -281,7 +268,9 @@ static void DoRender(
     int denoise_luma,
     bool ten_bit,
     py::object cancel_obj,
-    bool highlight_recovery)
+    bool highlight_recovery,
+    double frame_rate_conversion,
+    bool bake_vignette)
 {
     // Convert all py::object args to native C++ types while we still hold the GIL.
     int start_arg = start_obj.is_none() ? 0 : start_obj.cast<int>();
@@ -344,16 +333,23 @@ static void DoRender(
         decoder.loadFrame(frames[s], rawBuf, frameMeta);
         auto params0 = mcc::BuildFrameParams(frameMeta, containerMeta);
 
+        // Frame-rate plan: detect the source rate (median of inter-frame
+        // intervals) and, if a conversion target was requested, resample
+        // (duplicate/drop frames) to a constant output rate while staying
+        // time-aligned with the audio. With no target it's an identity 1:1
+        // map at the detected rate. frame_rate_conversion takes priority over
+        // the legacy fps override.
+        const double frcTarget = (frame_rate_conversion > 0.0) ? frame_rate_conversion : fps_arg;
+        std::vector<int64_t> ts(frames.begin(), frames.end());
+        auto plan = mcv::BuildFramePlan(ts, s, e, frcTarget);
+
         mcv::EncodeSettings es{};
         es.outputPath = output;
         es.codec = vcodec;
         es.width = int(params0.width);
         es.height = int(params0.height);
-        if (fps_arg > 0.0) {
-            es.fpsNum = int(fps_arg + 0.5); es.fpsDen = 1;
-        } else {
-            EstimateFps(frames, es.fpsNum, es.fpsDen);
-        }
+        es.fpsNum = plan.outRate.num;
+        es.fpsDen = plan.outRate.den;
         es.bitrateMbps = bitrate;
         es.audioSampleRate = decoder.audioSampleRateHz();
         es.audioChannels = decoder.numAudioChannels();
@@ -364,7 +360,7 @@ static void DoRender(
         es.colorMatrix    = csInfo.qtMatrix;
 
         mcv::MovEncoder enc(es);
-        const int total_to_render = e - s;
+        const int total_to_render = int(plan.srcIndex.size());
 
         // Denoise: MP4 only, and only when at least one strength is > 0.
         const bool wantDenoise = EndsWithMp4(output)
@@ -400,33 +396,28 @@ static void DoRender(
             // Sequential GPU bayer pipeline: decode -> upload bayer ->
             // normalise + LSM + debayer + matrix + RGB->NV12 -> NVENC.
             // CPU has almost nothing to do per frame so the producer-
-            // consumer overlap below doesn't pay off.
+            // consumer overlap below doesn't pay off. We iterate the frame
+            // plan (identity unless converting); a 1-frame decode cache means
+            // duplicated source frames aren't re-decoded.
             int written = 0;
-            {
-                const uint16_t* raw0 = reinterpret_cast<const uint16_t*>(rawBuf.data());
-                const float* lsm = params0.lensShadingMap.empty()
-                    ? nullptr : params0.lensShadingMap.data();
-                enc.WriteVideoFrameFromBayer(
-                    raw0, params0.asShotNeutral,
-                    lsm, int(params0.lsmWidth), int(params0.lsmHeight));
-                ++written;
-                if (has_progress) {
-                    py::gil_scoped_acquire gil;
-                    try { progress_obj(written, total_to_render); } catch (...) {}
-                }
-            }
-            std::vector<uint8_t> rb;
+            std::vector<uint8_t> rb = std::move(rawBuf);   // seed cache w/ probe frame
             nlohmann::json fm;
-            for (int i = s + 1; i < e; ++i) {
+            mcc::FrameParams cp = params0;
+            int cachedIdx = s;
+            for (int srcIdx : plan.srcIndex) {
                 if (cancel_check()) break;
-                decoder.loadFrame(frames[i], rb, fm);
-                auto p = mcc::BuildFrameParams(fm, containerMeta);
+                if (srcIdx != cachedIdx) {
+                    decoder.loadFrame(frames[srcIdx], rb, fm);
+                    cp = mcc::BuildFrameParams(fm, containerMeta);
+                    cachedIdx = srcIdx;
+                }
                 const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
-                const float* lsm = p.lensShadingMap.empty()
-                    ? nullptr : p.lensShadingMap.data();
+                const bool useLsm = bake_vignette && !cp.lensShadingMap.empty();
                 enc.WriteVideoFrameFromBayer(
-                    raw, p.asShotNeutral, lsm,
-                    int(p.lsmWidth), int(p.lsmHeight));
+                    raw, cp.asShotNeutral,
+                    useLsm ? cp.lensShadingMap.data() : nullptr,
+                    useLsm ? int(cp.lsmWidth)  : 0,
+                    useLsm ? int(cp.lsmHeight) : 0);
                 ++written;
                 if (has_progress) {
                     py::gil_scoped_acquire gil;
@@ -451,38 +442,25 @@ static void DoRender(
         bool producer_done = false;
         std::exception_ptr producer_err;
 
-        // Process the already-probed first frame and queue it.
-        {
-            ProcessedFrame first;
-            first.width = params0.width;
-            first.height = params0.height;
-            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
-            mcc::ProcessFrame(raw, params0, cs, first.rgb, highlight_recovery);
-            xform.Apply(first.rgb.data(), first.width, first.height);
-            if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
-                mcc::HighlightRolloff(first.rgb.data(), first.width, first.height);
-            }
-            if (wantDenoise) {
-                mcc::DenoiseRgb(first.rgb.data(), first.width, first.height,
-                                denoise_chroma, denoise_luma);
-            }
-            queue.push_back(std::move(first));
-        }
-
         std::thread producer([&]() {
             try {
-                std::vector<uint8_t> rb;
+                std::vector<uint8_t> rb = rawBuf;        // seed cache w/ probe frame
                 nlohmann::json fm;
-                for (int i = s + 1; i < e; ++i) {
+                mcc::FrameParams cp = params0;
+                int cachedIdx = s;
+                for (int srcIdx : plan.srcIndex) {
                     if (cancel.load()) break;
                     if (cancel_check()) { cancel.store(true); not_empty.notify_all(); break; }
-                    decoder.loadFrame(frames[i], rb, fm);
-                    auto p = mcc::BuildFrameParams(fm, containerMeta);
+                    if (srcIdx != cachedIdx) {
+                        decoder.loadFrame(frames[srcIdx], rb, fm);
+                        cp = mcc::BuildFrameParams(fm, containerMeta);
+                        cachedIdx = srcIdx;
+                    }
                     ProcessedFrame buf;
-                    buf.width = p.width;
-                    buf.height = p.height;
+                    buf.width = cp.width;
+                    buf.height = cp.height;
                     const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
-                    mcc::ProcessFrame(raw, p, cs, buf.rgb, highlight_recovery);
+                    mcc::ProcessFrame(raw, cp, cs, buf.rgb, highlight_recovery, bake_vignette);
                     xform.Apply(buf.rgb.data(), buf.width, buf.height);
                     if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
                         mcc::HighlightRolloff(buf.rgb.data(), buf.width, buf.height);
@@ -552,11 +530,15 @@ static void DoRender(
             decoder.loadAudio(chunks);
             std::vector<int16_t> all;
             for (auto& c : chunks) all.insert(all.end(), c.second.begin(), c.second.end());
-            // Trim audio to match the rendered video range (assumes audio starts with frame 0).
-            if (!all.empty() && (s > 0 || e < totalFrames) && es.fpsNum > 0) {
-                const double framePeriodSec = double(es.fpsDen) / double(es.fpsNum);
-                const size_t skip = size_t(s * framePeriodSec * es.audioSampleRate) * es.audioChannels;
-                const size_t keep = size_t((e - s) * framePeriodSec * es.audioSampleRate) * es.audioChannels;
+            // Trim audio to the rendered range using the source TIMESTAMPS
+            // (audio assumed to start with frame 0). Timestamp-based so it
+            // stays correct under frame-rate conversion, where output frame
+            // count != source frame count.
+            if (!all.empty() && (s > 0 || e < totalFrames) && e > s) {
+                const double skipSec = double(frames[s]   - frames[0]) / 1.0e9;
+                const double keepSec = double(frames[e-1] - frames[s]) / 1.0e9;
+                const size_t skip = size_t(skipSec * es.audioSampleRate) * es.audioChannels;
+                const size_t keep = size_t(keepSec * es.audioSampleRate) * es.audioChannels;
                 if (skip >= all.size()) {
                     all.clear();
                 } else {
@@ -655,11 +637,11 @@ PYBIND11_MODULE(mcraw, m) {
              "Returns int16 numpy (samples, channels), interleaved.")
         .def("process_frame", &PyDecoder::process_frame,
              py::arg("timestamp"), py::arg("colorspace") = "acescg",
-             py::arg("highlight_recovery") = false,
+             py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
              "Returns float32 numpy (H, W, 3) RGB in the requested color space.")
         .def("process_frame_rgb24", &PyDecoder::process_frame_rgb24,
              py::arg("timestamp"), py::arg("colorspace") = "srgb",
-             py::arg("highlight_recovery") = false,
+             py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
              "Returns (RGB888 packed bytes, height, width). No numpy required.");
 
     py::class_<PyOcio>(m, "OcioTransform")
@@ -686,6 +668,8 @@ PYBIND11_MODULE(mcraw, m) {
         py::arg("ten_bit") = false,
         py::arg("cancel") = py::none(),
         py::arg("highlight_recovery") = false,
+        py::arg("frame_rate_conversion") = 0.0,
+        py::arg("bake_vignette") = true,
         R"doc(Render an MCRAW file end-to-end.
 
 If `output` ends in '.mov', encodes a QuickTime file (codec defaults to prores4444).
@@ -694,7 +678,39 @@ Otherwise treats `output` as a directory and writes an EXR sequence.
 colorspace: acescg (default), rec709, aces2065-1, acescct,
             slog3-sgamut3cine, srgb, rec709-display
 codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
+frame_rate_conversion: target fps to convert to (duplicate/drop to keep A/V
+            sync); 0 = keep the source rate. bake_vignette: apply the lens
+            shading gainmap (default True); False keeps the natural vignette.
 )doc");
+
+    // Frame-rate plan preview for the GUI clip header: returns the detected
+    // source rate, the resulting output rate, output frame count, and the
+    // duplicated/dropped counts — WITHOUT rendering. start/end default to the
+    // whole clip; frame_rate_conversion=0 means no conversion (identity).
+    m.def("frame_plan_info",
+        [](PyDecoder& dec, py::object start_obj, py::object end_obj,
+           double frame_rate_conversion) -> py::dict {
+            const auto& fr = dec.frames();
+            const int total = int(fr.size());
+            const int s = start_obj.is_none() ? 0 : std::max(0, start_obj.cast<int>());
+            const int e = end_obj.is_none() ? total
+                                            : std::min(total, end_obj.cast<int>());
+            std::vector<int64_t> ts(fr.begin(), fr.end());
+            auto plan = mcv::BuildFramePlan(ts, s, std::max(s, e), frame_rate_conversion);
+            py::dict d;
+            d["src_fps"]    = plan.srcRate.fps();
+            d["out_fps"]    = plan.outRate.fps();
+            d["out_num"]    = plan.outRate.num;
+            d["out_den"]    = plan.outRate.den;
+            d["out_frames"] = int(plan.srcIndex.size());
+            d["duplicated"] = plan.duplicated;
+            d["dropped"]    = plan.dropped;
+            return d;
+        },
+        py::arg("decoder"), py::arg("start") = py::none(),
+        py::arg("end") = py::none(), py::arg("frame_rate_conversion") = 0.0,
+        "Frame-rate plan summary (src/out fps, frame count, dropped/duplicated) "
+        "without rendering. For the GUI clip header.");
 
     m.def("color_spaces", []() {
         py::list out;

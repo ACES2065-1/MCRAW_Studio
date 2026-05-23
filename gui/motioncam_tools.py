@@ -418,6 +418,10 @@ class RenderWorker(QtCore.QObject):
                 kwargs["ten_bit"] = True
             if self.settings.get("highlight_recovery"):
                 kwargs["highlight_recovery"] = True
+            if self.settings.get("frame_rate_conversion", 0.0) > 0.0:
+                kwargs["frame_rate_conversion"] = float(self.settings["frame_rate_conversion"])
+            if not self.settings.get("bake_vignette", True):
+                kwargs["bake_vignette"] = False
             kwargs["cancel"] = self._check_pause_cancel
             mcraw.render(**kwargs)
             if self._cancel_event.is_set():
@@ -478,22 +482,23 @@ class ThumbWorker(QtCore.QObject):
     """
     done = QtCore.Signal(str, int, QtGui.QImage)
 
-    def submit(self, path: str, frame_idx: int) -> None:
+    def submit(self, path: str, frame_idx: int, bake_vignette: bool = True) -> None:
         threading.Thread(
-            target=self._work, args=(path, frame_idx), daemon=True
+            target=self._work, args=(path, frame_idx, bake_vignette), daemon=True
         ).start()
 
     _PREVIEW_MAX_W = 1920
     _PREVIEW_MAX_H = 1080
 
-    def _work(self, path: str, frame_idx: int) -> None:
+    def _work(self, path: str, frame_idx: int, bake_vignette: bool = True) -> None:
         try:
             d = mcraw.Decoder(path)
             timestamps = d.frames
             if frame_idx < 0 or frame_idx >= len(timestamps):
                 return
             # numpy-free path: C++ side returns RGB888 packed bytes directly.
-            buf, h, w = d.process_frame_rgb24(timestamps[frame_idx], "srgb")
+            buf, h, w = d.process_frame_rgb24(timestamps[frame_idx], "srgb",
+                                              False, bake_vignette)
             full = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
             if w > self._PREVIEW_MAX_W or h > self._PREVIEW_MAX_H:
                 img = full.scaled(
@@ -762,6 +767,43 @@ class MainWindow(QtWidgets.QMainWindow):
             "outside the clipped region."
         )
 
+        # Frame-rate conversion: checkbox + target dropdown. Off = keep the
+        # source rate; on = resample (duplicate/drop) to the chosen constant
+        # rate, staying in A/V sync.
+        self.frcCheck = QtWidgets.QCheckBox("Convert to")
+        self.frcCheck.setToolTip(
+            "Resample to a constant target frame rate, duplicating or dropping\n"
+            "frames to keep audio in sync. Leave off to keep the source rate.\n"
+            "Set this before importing into DaVinci / Premiere."
+        )
+        self.frcCombo = QtWidgets.QComboBox()
+        for _lab, _val in (("23.976", 23.976), ("24", 24.0), ("25", 25.0),
+                           ("29.97", 29.97), ("30", 30.0), ("48", 48.0),
+                           ("50", 50.0), ("59.94", 59.94), ("60", 60.0)):
+            self.frcCombo.addItem(f"{_lab} fps", _val)
+        self.frcCombo.setCurrentIndex(self.frcCombo.findData(24.0))
+        self.frcCombo.setEnabled(False)
+        self.frcCheck.toggled.connect(self.frcCombo.setEnabled)
+        self.frcCheck.toggled.connect(lambda _=None: self._refresh_clip_header())
+        self.frcCombo.currentIndexChanged.connect(lambda _=None: self._refresh_clip_header())
+        frcComposite = QtWidgets.QWidget()
+        frcRow = QtWidgets.QHBoxLayout(frcComposite)
+        frcRow.setContentsMargins(0, 0, 0, 0)
+        frcRow.setSpacing(4)
+        frcRow.addWidget(self.frcCheck)
+        frcRow.addWidget(self.frcCombo, 1)
+
+        # Vignette / lens-shading correction. On by default (matches the raw
+        # pipeline); off keeps the natural optical falloff in the corners.
+        self.vignetteCheck = QtWidgets.QCheckBox("Bake vignette correction")
+        self.vignetteCheck.setChecked(True)
+        self.vignetteCheck.setToolTip(
+            "Apply the lens-shading gainmap to flatten the natural lens vignette\n"
+            "and corner colour cast. Turn off to keep the natural optical falloff\n"
+            "and avoid lifting noise in dark corners."
+        )
+        self.vignetteCheck.toggled.connect(self._on_vignette_toggled)
+
         self.denoiseChromaSpin = QtWidgets.QSpinBox()
         self.denoiseChromaSpin.setRange(0, 100)
         self.denoiseChromaSpin.setValue(0)
@@ -846,6 +888,8 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(_lbl("Bitrate:"),    r, 0); grid.addWidget(self.bitrateSpin,    r, 1)
         grid.addWidget(_lbl("Bit depth:"),  r, 2); grid.addWidget(self.tenBitCheck,    r, 3); r += 1
         grid.addWidget(_lbl("Highlights:"), r, 0); grid.addWidget(self.highlightRecoveryCheck, r, 1, 1, 3); r += 1
+        grid.addWidget(_lbl("Frame rate:"), r, 0); grid.addWidget(frcComposite, r, 1)
+        grid.addWidget(_lbl("Vignette:"),   r, 2); grid.addWidget(self.vignetteCheck, r, 3); r += 1
         grid.addWidget(_lbl("Denoise color:"), r, 0); grid.addWidget(self.denoiseChromaSpin, r, 1)
         grid.addWidget(_lbl("Denoise luma:"),  r, 2); grid.addWidget(self.denoiseLumaSpin,   r, 3); r += 1
         grid.addWidget(_lbl("EXR compression:"), r, 0); grid.addWidget(self.exrCompCombo, r, 1)
@@ -1067,12 +1111,13 @@ class MainWindow(QtWidgets.QMainWindow):
                     self, "Failed to open", f"{Path(p).name}\n{exc}")
                 continue
             # MotionCam timestamps are in nanoseconds (Android camera clock).
-            fps = 0.0
-            if total >= 2 and ts[-1] > ts[0]:
-                fps = 1.0e9 * (total - 1) / float(ts[-1] - ts[0])
-            duration = (total / fps) if fps > 0 else 0.0
+            # Use the MEDIAN inter-frame interval (robust to dropped frames),
+            # matching the C++ DetectFrameRate — the mean is skewed by drops.
+            fps = self._median_fps(ts)
+            duration = (ts[-1] - ts[0]) / 1.0e9 if total >= 2 else 0.0
             self._file_state[p] = {
                 "total": total,
+                "ts": ts,
                 "fps": fps,
                 "duration": duration,
                 "start": 0,
@@ -1103,6 +1148,61 @@ class MainWindow(QtWidgets.QMainWindow):
             return f"{int(m)}:{s:05.2f}"
         h, m = divmod(m, 60.0)
         return f"{int(h)}:{int(m):02d}:{s:05.2f}"
+
+    @staticmethod
+    def _median_fps(ts: list) -> float:
+        """Source fps from the median inter-frame interval (robust to drops)."""
+        if len(ts) < 2:
+            return 0.0
+        gaps = sorted(ts[i + 1] - ts[i] for i in range(len(ts) - 1) if ts[i + 1] > ts[i])
+        if not gaps:
+            return 0.0
+        med = gaps[len(gaps) // 2]
+        return 1.0e9 / med if med > 0 else 0.0
+
+    @staticmethod
+    def _plan_counts(ts: list, start: int, end: int, target_fps: float):
+        """Mirror of C++ BuildFramePlan: (out_frames, dropped, duplicated) for
+        a nearest-timestamp resample to a constant target_fps. target<=0 = off."""
+        n = len(ts)
+        start = max(0, min(start, n))
+        end = max(start, min(end, n))
+        if target_fps <= 0.0 or end - start <= 0:
+            return (end - start, 0, 0)
+        t0 = ts[start]
+        span = ts[end - 1] - t0
+        if end - start == 1 or span <= 0:
+            return (1, 0, 0)
+        out_count = max(1, round(span / 1.0e9 * target_fps) + 1)
+        cursor, last, dup = start, -1, 0
+        used = set()
+        for j in range(out_count):
+            tj = t0 + round(j / target_fps * 1.0e9)
+            while cursor + 1 < end and abs(ts[cursor + 1] - tj) <= abs(ts[cursor] - tj):
+                cursor += 1
+            if cursor == last:
+                dup += 1
+            used.add(cursor)
+            last = cursor
+        dropped = sum(1 for i in range(start, end) if i not in used)
+        return (out_count, dropped, dup)
+
+    def _frc_target(self) -> float:
+        """Selected conversion target fps, or 0.0 when conversion is off."""
+        if hasattr(self, "frcCheck") and self.frcCheck.isChecked():
+            return float(self.frcCombo.currentData() or 0.0)
+        return 0.0
+
+    def _refresh_clip_header(self) -> None:
+        """Re-apply every list item's text so the fps line reflects the current
+        frame-rate-conversion setting."""
+        if not hasattr(self, "dropList"):
+            return
+        for i in range(self.dropList.count()):
+            it = self.dropList.item(i)
+            p = it.data(QtCore.Qt.UserRole)
+            if p:
+                self._apply_item_text(it, p)
 
     @staticmethod
     def _format_fps(fps: float) -> str:
@@ -1136,11 +1236,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
         line1 = f"{name}  —  {tag}"
         # Second line: frame count, fps, duration, render range if non-default.
-        bits = [
-            f"{st['total']} frames",
-            f"{self._format_fps(st['fps'])} fps",
-            self._format_duration(st['duration']),
-        ]
+        target = self._frc_target()
+        if target > 0.0 and st.get("ts"):
+            out_n, dropped, dup = self._plan_counts(
+                st["ts"], st["start"], st["end"], target)
+            fps_bit = (f"{self._format_fps(st['fps'])} → {self._format_fps(target)} fps "
+                       f"(−{dropped} / +{dup})")
+            count_bit = f"{out_n} frames"
+        else:
+            fps_bit = f"{self._format_fps(st['fps'])} fps"
+            count_bit = f"{st['total']} frames"
+        bits = [count_bit, fps_bit, self._format_duration(st['duration'])]
         if st['start'] != 0 or st['end'] != st['total']:
             bits.append(f"range [{st['start']}..{st['end']}]")
         line2 = "  ·  ".join(bits)
@@ -1222,6 +1328,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "bitrate":            int(self.bitrateSpin.value()),
             "ten_bit":            bool(self.tenBitCheck.isChecked()),
             "highlight_recovery": bool(self.highlightRecoveryCheck.isChecked()),
+            "frc_enabled":        bool(self.frcCheck.isChecked()),
+            "frc_target":         float(self.frcCombo.currentData() or 0.0),
+            "bake_vignette":      bool(self.vignetteCheck.isChecked()),
             "denoise_chroma":     int(self.denoiseChromaSpin.value()),
             "denoise_luma":       int(self.denoiseLumaSpin.value()),
             "exr_compression":    self.exrCompCombo.currentData(),
@@ -1253,6 +1362,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tenBitCheck.setChecked(bool(data["ten_bit"]))
         if "highlight_recovery" in data:
             self.highlightRecoveryCheck.setChecked(bool(data["highlight_recovery"]))
+        if "frc_target" in data:
+            i = self.frcCombo.findData(float(data["frc_target"]))
+            if i >= 0:
+                self.frcCombo.setCurrentIndex(i)
+        if "frc_enabled" in data:
+            self.frcCheck.setChecked(bool(data["frc_enabled"]))
+        if "bake_vignette" in data:
+            self.vignetteCheck.setChecked(bool(data["bake_vignette"]))
         if "denoise_chroma" in data:
             try: self.denoiseChromaSpin.setValue(int(data["denoise_chroma"]))
             except Exception: pass
@@ -1325,6 +1442,14 @@ class MainWindow(QtWidgets.QMainWindow):
         if not items:
             return None
         return items[0].data(QtCore.Qt.UserRole)
+
+    def _on_vignette_toggled(self, _checked: bool = False) -> None:
+        # The cached preview was decoded with the previous vignette setting —
+        # invalidate every clip's thumb so the current one re-decodes.
+        for st in self._file_state.values():
+            st["thumb_img"] = None
+            st["thumb_frame"] = None
+        self._refresh_preview_for_current()
 
     def _refresh_preview_for_current(self) -> None:
         path = self._current_path()
@@ -1406,7 +1531,8 @@ class MainWindow(QtWidgets.QMainWindow):
         st = self._file_state.get(path) if path else None
         if not st:
             return
-        self._thumb.submit(path, int(st["scrub"]))
+        bake = self.vignetteCheck.isChecked() if hasattr(self, "vignetteCheck") else True
+        self._thumb.submit(path, int(st["scrub"]), bake)
 
     @QtCore.Slot(str, int, QtGui.QImage)
     def _on_thumb_done(self, path: str, frame_idx: int, img: QtGui.QImage) -> None:
@@ -1703,6 +1829,14 @@ class MainWindow(QtWidgets.QMainWindow):
                 settings["ten_bit"] = True
         if self.highlightRecoveryCheck.isChecked():
             settings["highlight_recovery"] = True
+        # Vignette + frame-rate conversion apply to video targets (the GPU/CPU
+        # bayer pipeline); EXR is a raw scene-referred dump where neither makes
+        # sense to bake in.
+        if is_video:
+            settings["bake_vignette"] = bool(self.vignetteCheck.isChecked())
+            tgt = self._frc_target()
+            if tgt > 0.0:
+                settings["frame_rate_conversion"] = tgt
         if fmt == "mp4":
             settings["denoise_chroma"] = int(self.denoiseChromaSpin.value())
             settings["denoise_luma"] = int(self.denoiseLumaSpin.value())
@@ -1893,7 +2027,7 @@ def _load_stylesheet() -> str:
         return ""
 
 
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"

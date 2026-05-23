@@ -205,7 +205,8 @@ void ProcessFrame(
     const FrameParams& params,
     OutputColorSpace output,
     std::vector<float>& outRgb,
-    bool highlightRecovery)
+    bool highlightRecovery,
+    bool applyLensShading)
 {
     const size_t numPixels = size_t(params.width) * size_t(params.height);
     std::vector<float> bayerFloat(numPixels);
@@ -216,7 +217,7 @@ void ProcessFrame(
         params.blackPerPosition, params.whiteLevel, params.asShotNeutral,
         params.cfa);
 
-    if (!params.lensShadingMap.empty()) {
+    if (applyLensShading && !params.lensShadingMap.empty()) {
         ApplyLensShading(
             bayerFloat.data(),
             params.width, params.height,

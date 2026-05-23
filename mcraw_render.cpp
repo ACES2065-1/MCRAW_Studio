@@ -5,6 +5,7 @@
 #include <motioncam/ExrWriter.hpp>
 #include <motioncam/OcioTransform.hpp>
 #include <motioncam/MovEncoder.hpp>
+#include <motioncam/FrameTiming.hpp>
 #include <motioncam/Trimmer.hpp>
 
 #include <algorithm>
@@ -40,11 +41,13 @@ struct Args {
     motioncam::video::Codec codec = motioncam::video::Codec::ProRes4444;
     int bitrateMbps = 80;
     double fpsOverride = 0.0;
+    double convertFps = 0.0;   // >0: frame-rate-convert (duplicate/drop) to this constant rate
     motioncam::color::ExrCompression exrCompression = motioncam::color::ExrCompression::ZIP;
     int denoiseChroma = 0;   // 0..100, MP4-only (mov/exr ignore)
     int denoiseLuma   = 0;   // 0..100, MP4-only
     bool tenBit = false;     // H.265 / AV1: encode 10-bit. ProRes/DNxHR/CineForm are already 10/12-bit.
     bool highlightRecovery = false;  // Pre-WB saturation neutralisation + (display-encoded only) soft knee
+    bool bakeVignette = true;        // Apply lens-shading gainmap; false keeps natural vignette
 };
 
 void PrintUsage() {
@@ -120,6 +123,7 @@ bool ParseArgs(int argc, const char* argv[], Args& out) {
         }
         else if (a == "--bitrate") out.bitrateMbps = std::stoi(needValue());
         else if (a == "--fps") out.fpsOverride = std::stod(needValue());
+        else if (a == "--convert-fps") out.convertFps = std::stod(needValue());
         else if (a == "--start") out.startFrame = std::stoi(needValue());
         else if (a == "--end") out.endFrame = std::stoi(needValue());
         else if (a == "--exr-compression") {
@@ -131,6 +135,7 @@ bool ParseArgs(int argc, const char* argv[], Args& out) {
         else if (a == "--denoise-luma")   out.denoiseLuma   = std::stoi(needValue());
         else if (a == "--ten-bit" || a == "--10-bit") out.tenBit = true;
         else if (a == "--highlight-recovery" || a == "--recover-highlights") out.highlightRecovery = true;
+        else if (a == "--no-vignette" || a == "--no-vignette-correction") out.bakeVignette = false;
         else if (a == "-h" || a == "--help") return false;
         else throw std::runtime_error("unknown flag: " + a);
     }
@@ -145,21 +150,6 @@ bool ParseArgs(int argc, const char* argv[], Args& out) {
         else                                      out.format = OutputFormat::Exr;
     }
     return true;
-}
-
-void EstimateFps(const std::vector<motioncam::Timestamp>& frames, int& fpsNum, int& fpsDen) {
-    fpsNum = 30; fpsDen = 1;
-    if (frames.size() < 2) return;
-    const int64_t totalNs = frames.back() - frames.front();
-    if (totalNs <= 0) return;
-    const double avgPeriodNs = double(totalNs) / double(frames.size() - 1);
-    const double fps = 1.0e9 / avgPeriodNs;
-    // Snap to common fractional rates
-    auto near = [&](double target) { return std::abs(fps - target) < 0.05; };
-    if      (near(23.976)) { fpsNum = 24000; fpsDen = 1001; }
-    else if (near(29.97))  { fpsNum = 30000; fpsDen = 1001; }
-    else if (near(59.94))  { fpsNum = 60000; fpsDen = 1001; }
-    else                    { fpsNum = int(fps + 0.5); fpsDen = 1; }
 }
 
 int RunExr(motioncam::Decoder& decoder, const Args& args, int start, int end) {
@@ -257,16 +247,21 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     const int width = static_cast<int>(params0.width);
     const int height = static_cast<int>(params0.height);
 
+    // Frame-rate plan: median-detected source rate, optionally resampled to a
+    // constant target (--convert-fps) by duplicating/dropping frames to keep
+    // A/V sync. Identity 1:1 at the source rate otherwise. --fps is the legacy
+    // override and is treated as a conversion target if --convert-fps is unset.
+    const double frcTarget = (args.convertFps > 0.0) ? args.convertFps : args.fpsOverride;
+    std::vector<int64_t> ts(frames.begin(), frames.end());
+    auto plan = motioncam::video::BuildFramePlan(ts, start, end, frcTarget);
+
     motioncam::video::EncodeSettings es{};
     es.outputPath = args.output;
     es.codec = args.codec;
     es.width = width;
     es.height = height;
-    if (args.fpsOverride > 0.0) {
-        es.fpsNum = int(args.fpsOverride + 0.5); es.fpsDen = 1;
-    } else {
-        EstimateFps(frames, es.fpsNum, es.fpsDen);
-    }
+    es.fpsNum = plan.outRate.num;
+    es.fpsDen = plan.outRate.den;
     es.bitrateMbps = args.bitrateMbps;
     es.audioSampleRate = decoder.audioSampleRateHz();
     es.audioChannels = decoder.numAudioChannels();
@@ -283,6 +278,11 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
                     ? (xform.isBaked() ? " [baked fast-path]" : " [via OCIO]")
                     : "")
               << "\n";
+    std::cout << "FPS: " << plan.srcRate.fps() << " -> " << plan.outRate.fps()
+              << "  frames: " << plan.srcIndex.size()
+              << "  dropped: " << plan.dropped
+              << "  duplicated: " << plan.duplicated
+              << (args.bakeVignette ? "" : "  [vignette off]") << "\n";
 
     motioncam::video::MovEncoder enc(es);
 
@@ -318,32 +318,29 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     }
 
     int written = 0;
-    const int totalToRender = end - start;
+    const int totalToRender = int(plan.srcIndex.size());
 
     if (gpuBayerActive) {
         // Sequential GPU bayer pipeline: decode -> upload bayer -> kernels
-        // -> NV12 -> NVENC, one frame at a time. The CPU side has almost
-        // nothing to do, so the producer-consumer overlap doesn't pay off.
-        {
-            const uint16_t* raw0 = reinterpret_cast<const uint16_t*>(rawBuf.data());
-            const float* lsm = params0.lensShadingMap.empty()
-                ? nullptr : params0.lensShadingMap.data();
-            enc.WriteVideoFrameFromBayer(
-                raw0, params0.asShotNeutral,
-                lsm, int(params0.lsmWidth), int(params0.lsmHeight));
-            ++written;
-        }
-        std::vector<uint8_t> rb;
+        // -> NV12/P010 -> NVENC. Iterates the frame plan (identity unless
+        // converting); a 1-frame decode cache avoids re-decoding duplicates.
+        std::vector<uint8_t> rb = std::move(rawBuf);   // seed cache w/ probe frame
         nlohmann::json fm;
-        for (int i = start + 1; i < end; ++i) {
-            decoder.loadFrame(frames[i], rb, fm);
-            auto p = motioncam::color::BuildFrameParams(fm, containerMeta);
+        motioncam::color::FrameParams cp = params0;
+        int cachedIdx = start;
+        for (int srcIdx : plan.srcIndex) {
+            if (srcIdx != cachedIdx) {
+                decoder.loadFrame(frames[srcIdx], rb, fm);
+                cp = motioncam::color::BuildFrameParams(fm, containerMeta);
+                cachedIdx = srcIdx;
+            }
             const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
-            const float* lsm = p.lensShadingMap.empty()
-                ? nullptr : p.lensShadingMap.data();
+            const bool useLsm = args.bakeVignette && !cp.lensShadingMap.empty();
             enc.WriteVideoFrameFromBayer(
-                raw, p.asShotNeutral, lsm,
-                int(p.lsmWidth), int(p.lsmHeight));
+                raw, cp.asShotNeutral,
+                useLsm ? cp.lensShadingMap.data() : nullptr,
+                useLsm ? int(cp.lsmWidth)  : 0,
+                useLsm ? int(cp.lsmHeight) : 0);
             ++written;
             if (written % 24 == 0) {
                 std::cout << "Encoded frame " << written << "/"
@@ -372,38 +369,25 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     bool producer_done = false;
     std::exception_ptr producer_err;
 
-    // Process the already-probed first frame and queue it.
-    {
-        ProcessedFrame first;
-        first.width = params0.width;
-        first.height = params0.height;
-        const uint16_t* rawU16 = reinterpret_cast<const uint16_t*>(rawBuf.data());
-        motioncam::color::ProcessFrame(rawU16, params0, args.colorSpace, first.rgb, args.highlightRecovery);
-        xform.Apply(first.rgb.data(), first.width, first.height);
-        if (args.highlightRecovery && motioncam::color::IsDisplayEncoded(args.colorSpace)) {
-            motioncam::color::HighlightRolloff(first.rgb.data(), first.width, first.height);
-        }
-        if (wantDenoise) {
-            motioncam::color::DenoiseRgb(
-                first.rgb.data(), first.width, first.height,
-                args.denoiseChroma, args.denoiseLuma);
-        }
-        queue.push_back(std::move(first));
-    }
-
     std::thread producer([&]() {
         try {
-            std::vector<uint8_t> rb;
+            std::vector<uint8_t> rb = rawBuf;       // seed cache w/ probe frame
             nlohmann::json fm;
-            for (int i = start + 1; i < end; ++i) {
+            motioncam::color::FrameParams cp = params0;
+            int cachedIdx = start;
+            for (int srcIdx : plan.srcIndex) {
                 if (cancel.load()) break;
-                decoder.loadFrame(frames[i], rb, fm);
-                auto p = motioncam::color::BuildFrameParams(fm, containerMeta);
+                if (srcIdx != cachedIdx) {
+                    decoder.loadFrame(frames[srcIdx], rb, fm);
+                    cp = motioncam::color::BuildFrameParams(fm, containerMeta);
+                    cachedIdx = srcIdx;
+                }
                 ProcessedFrame buf;
-                buf.width = p.width;
-                buf.height = p.height;
+                buf.width = cp.width;
+                buf.height = cp.height;
                 const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
-                motioncam::color::ProcessFrame(raw, p, args.colorSpace, buf.rgb, args.highlightRecovery);
+                motioncam::color::ProcessFrame(raw, cp, args.colorSpace, buf.rgb,
+                                               args.highlightRecovery, args.bakeVignette);
                 xform.Apply(buf.rgb.data(), buf.width, buf.height);
                 if (args.highlightRecovery && motioncam::color::IsDisplayEncoded(args.colorSpace)) {
                     motioncam::color::HighlightRolloff(buf.rgb.data(), buf.width, buf.height);
@@ -467,12 +451,14 @@ after_video_loop:
         for (auto& chunk : audioChunks) {
             allSamples.insert(allSamples.end(), chunk.second.begin(), chunk.second.end());
         }
-        // Trim audio to match the rendered video range. Assumes audio starts at the
-        // same wall-clock time as frame 0 (true for typical MotionCam recordings).
-        if (!allSamples.empty() && (start > 0 || end < int(frames.size())) && es.fpsNum > 0) {
-            const double framePeriodSec = double(es.fpsDen) / double(es.fpsNum);
-            const size_t skip = size_t(start * framePeriodSec * es.audioSampleRate) * es.audioChannels;
-            const size_t keep = size_t((end - start) * framePeriodSec * es.audioSampleRate) * es.audioChannels;
+        // Trim audio to the rendered range using the source TIMESTAMPS (audio
+        // assumed to start with frame 0). Timestamp-based so it stays correct
+        // under frame-rate conversion (output frame count != source count).
+        if (!allSamples.empty() && (start > 0 || end < int(frames.size())) && end > start) {
+            const double skipSec = double(frames[start]   - frames[0])     / 1.0e9;
+            const double keepSec = double(frames[end - 1] - frames[start]) / 1.0e9;
+            const size_t skip = size_t(skipSec * es.audioSampleRate) * es.audioChannels;
+            const size_t keep = size_t(keepSec * es.audioSampleRate) * es.audioChannels;
             if (skip >= allSamples.size()) {
                 allSamples.clear();
             } else {

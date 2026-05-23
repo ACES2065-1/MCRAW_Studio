@@ -78,7 +78,11 @@ void ProcessFrame(
     // were at sensor saturation (kills the magenta-sun artifact) and applies
     // a soft highlight rolloff for display-encoded outputs. No-op for
     // scene-referred outputs except for the saturation neutralisation.
-    bool highlightRecovery = false);
+    bool highlightRecovery = false,
+    // Lens-shading (vignette) correction: when true (default) the gainmap from
+    // the frame metadata is applied before debayer. Pass false to keep the
+    // natural optical vignette / corner falloff.
+    bool applyLensShading = true);
 
 // True if the named output is "display-encoded" (carries a non-linear
 // transfer like Rec.709 / sRGB / PQ / HLG). When highlight recovery is
