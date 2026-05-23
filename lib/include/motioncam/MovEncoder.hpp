@@ -122,6 +122,12 @@ public:
         // path no longer has to be skipped for highlight-recovery renders.
         bool highlightRecovery = false;
         bool displayEncoded    = false;
+
+        // Phase F: output-space denoise strengths (0..100, MP4 deliverables
+        // only — the caller passes 0 otherwise). Non-zero runs the GPU denoise
+        // at the end of the chain, so denoise no longer forces the CPU path.
+        int  denoiseChroma = 0;
+        int  denoiseLuma   = 0;
     };
 
     bool EnableGpuBayerPipeline(const GpuBayerSetup& setup);

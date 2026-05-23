@@ -235,6 +235,14 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="srgb", codec="av1_nvenc", start=0, end=8, bitrate=30),
+
+    # Denoise via NVENC (MP4-only) — exercises the Phase F GPU denoise kernels
+    # when MCRAW_GPU_YUV=1, the CPU DenoiseRgb otherwise.
+    Case("mp4_h265nvenc_denoise",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="srgb", codec="h265_nvenc", start=0, end=8, bitrate=30,
+         denoise_chroma=60, denoise_luma=40),
 ]
 
 

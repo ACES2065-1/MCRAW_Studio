@@ -1065,6 +1065,8 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
     C.highlight_recovery = setup.highlightRecovery ? 1 : 0;
     C.highlight_rolloff  = (setup.highlightRecovery && setup.displayEncoded) ? 1 : 0;
     C.yuv_matrix = p->useCudaBt2020 ? 1 : 0;
+    C.denoise_chroma = setup.denoiseChroma;
+    C.denoise_luma   = setup.denoiseLuma;
     C.lsm_w  = 0;
     C.lsm_h  = 0;
     C.lsm_host = nullptr;

@@ -377,7 +377,7 @@ static void DoRender(
         // space has a BakedTransform. Falls back silently to the CPU
         // producer-consumer below otherwise.
         bool gpuBayerActive = false;
-        if (!wantDenoise) {
+        {
             mcv::MovEncoder::GpuBayerSetup setup{};
             setup.targetColorSpace = static_cast<int>(cs);
             std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
@@ -388,9 +388,11 @@ static void DoRender(
             setup.cfaPattern = static_cast<int>(params0.cfa);
             // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
             setup.ocioColorSpace = csInfo.ocioName;
-            // Phase E.3: highlight recovery now runs on the GPU.
             setup.highlightRecovery = highlight_recovery;
             setup.displayEncoded    = mcc::IsDisplayEncoded(cs);
+            // Denoise is MP4-only; wantDenoise already encodes that.
+            setup.denoiseChroma = wantDenoise ? denoise_chroma : 0;
+            setup.denoiseLuma   = wantDenoise ? denoise_luma   : 0;
             gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
         }
 
@@ -725,6 +727,27 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
         };
     }, "List supported video codecs (h264_nvenc / h265_nvenc / av1_nvenc require an NVIDIA GPU).");
 
+    // CPU reference denoise (the same DenoiseRgb the CPU render path uses).
+    // In-place on a float32 (H, W, 3) array. Exposed for the Phase F GPU-vs-CPU
+    // correctness test.
+    m.def("denoise_rgb",
+        [](py::array_t<float, py::array::c_style | py::array::forcecast> rgb,
+           int chroma, int luma) -> py::array_t<float> {
+            py::buffer_info buf = rgb.request();
+            if (buf.ndim != 3 || buf.shape[2] != 3)
+                throw std::runtime_error("expected float32 array of shape (H, W, 3)");
+            const int height = int(buf.shape[0]);
+            const int width  = int(buf.shape[1]);
+            float* data = static_cast<float*>(buf.ptr);
+            {
+                py::gil_scoped_release release;
+                mcc::DenoiseRgb(data, uint32_t(width), uint32_t(height), chroma, luma);
+            }
+            return rgb;
+        },
+        py::arg("rgb"), py::arg("chroma"), py::arg("luma"),
+        "Apply the CPU output-space denoise in-place to a float32 (H,W,3) array.");
+
     // ---- CUDA probes (Tier 2.1 GPU pipeline) ----
     m.def("cuda_built", []() -> bool {
 #if MCRAW_HAVE_CUDA
@@ -760,7 +783,8 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
     m.def("cuda_process_frame_phase_c",
         [](PyDecoder& pyDec, int64_t timestamp,
            const std::string& target_colorspace,
-           bool highlight_recovery) -> py::array_t<float> {
+           bool highlight_recovery,
+           int denoise_chroma, int denoise_luma) -> py::array_t<float> {
             mc::Decoder& dec = *pyDec.underlying();
 
             // Map the target colorspace to a (matrix, curve) plan.
@@ -920,6 +944,8 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
             C.height = int(height);
             C.highlight_recovery = highlight_recovery ? 1 : 0;
             C.highlight_rolloff  = (highlight_recovery && mcc::IsDisplayEncoded(cs)) ? 1 : 0;
+            C.denoise_chroma = denoise_chroma;
+            C.denoise_luma   = denoise_luma;
             // Pass-through optional LSM. params.lensShadingMap is already
             // flattened as 4 * lsmW * lsmH channel-first floats by
             // BuildFrameParams — exactly what the kernel expects.
@@ -949,8 +975,9 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
         },
         py::arg("decoder"), py::arg("timestamp"), py::arg("target_colorspace"),
         py::arg("highlight_recovery") = false,
+        py::arg("denoise_chroma") = 0, py::arg("denoise_luma") = 0,
         "Phase C.1 GPU bayer pipeline (normalise + debayer + cam-to-output "
-        "matrix + optional curve, + optional highlight recovery/rolloff). "
+        "matrix + optional curve, highlight recovery/rolloff, denoise). "
         "Returns float32 (H, W, 3) RGB in the target colour space. For "
         "correctness testing against process_frame.");
 

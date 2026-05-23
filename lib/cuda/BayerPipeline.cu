@@ -21,9 +21,11 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <mutex>
+#include <vector>
 
 namespace motioncam {
 namespace cuda {
@@ -61,6 +63,41 @@ void ReleaseLut3DLocked() {
     if (gLutArray) { cudaFreeArray(gLutArray);          gLutArray = nullptr; }
     gLutN = 0;
     gLutValid = false;
+}
+
+// Phase F: denoise scratch (output-space Y/Cb/Cr planes + one shared tmp, plus
+// a tiny device buffer for the separable Gaussian weights). Allocated lazily
+// when a denoise render first runs; sized to width*height.
+float*  gDnY       = nullptr;
+float*  gDnCb      = nullptr;
+float*  gDnCr      = nullptr;
+float*  gDnTmp     = nullptr;
+float*  gDnWeights = nullptr;       // up to 65 Gaussian taps
+size_t  gDnN       = 0;
+constexpr int kDnMaxRadius = 32;    // matches Denoise.cpp's cap
+
+void ReleaseDenoiseLocked() {
+    if (gDnY)       { cudaFree(gDnY);       gDnY = nullptr; }
+    if (gDnCb)      { cudaFree(gDnCb);      gDnCb = nullptr; }
+    if (gDnCr)      { cudaFree(gDnCr);      gDnCr = nullptr; }
+    if (gDnTmp)     { cudaFree(gDnTmp);     gDnTmp = nullptr; }
+    if (gDnWeights) { cudaFree(gDnWeights); gDnWeights = nullptr; }
+    gDnN = 0;
+}
+
+bool EnsureDenoiseBuffers(size_t n) {
+    if (n == gDnN && gDnY && gDnCb && gDnCr && gDnTmp && gDnWeights) return true;
+    ReleaseDenoiseLocked();
+    const size_t bytes = n * sizeof(float);
+    cudaError_t e1 = cudaMalloc(reinterpret_cast<void**>(&gDnY),   bytes);
+    cudaError_t e2 = cudaMalloc(reinterpret_cast<void**>(&gDnCb),  bytes);
+    cudaError_t e3 = cudaMalloc(reinterpret_cast<void**>(&gDnCr),  bytes);
+    cudaError_t e4 = cudaMalloc(reinterpret_cast<void**>(&gDnTmp), bytes);
+    cudaError_t e5 = cudaMalloc(reinterpret_cast<void**>(&gDnWeights),
+                                size_t(kDnMaxRadius * 2 + 1) * sizeof(float));
+    if (e1 || e2 || e3 || e4 || e5) { ReleaseDenoiseLocked(); return false; }
+    gDnN = n;
+    return true;
 }
 
 bool EnsureBuffers(int width, int height) {
@@ -105,6 +142,7 @@ void ReleaseBayerPipeline() {
     if (gBayerFloat) { cudaFree(gBayerFloat); gBayerFloat = nullptr; }
     if (gRgbFloat)   { cudaFree(gRgbFloat);   gRgbFloat   = nullptr; }
     if (gLsmDevice)  { cudaFree(gLsmDevice);  gLsmDevice  = nullptr; }
+    ReleaseDenoiseLocked();
     gBufW = 0;
     gBufH = 0;
     gLsmW = 0;
@@ -476,6 +514,104 @@ __global__ void HighlightRolloffKernel(
 }
 
 // ============================================================================
+// Kernels 7-10 (Phase F): output-space denoise
+// (matches Denoise.cpp::DenoiseRgb — same Y/Cb=B-Y/Cr=R-Y decomposition,
+//  separable Gaussian on chroma, 5x5 bilateral on luma, recombine.)
+// ============================================================================
+
+namespace {
+constexpr float kDnRy = 0.2126f;
+constexpr float kDnGy = 0.7152f;
+constexpr float kDnBy = 0.0722f;
+}
+
+__global__ void SplitYCbCrKernel(
+    const float* __restrict__ rgb,
+    float* __restrict__ Y, float* __restrict__ Cb, float* __restrict__ Cr,
+    int width, int height)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const size_t i = size_t(y) * size_t(width) + size_t(x);
+    const float r = rgb[i*3 + 0], g = rgb[i*3 + 1], b = rgb[i*3 + 2];
+    const float yv = kDnRy * r + kDnGy * g + kDnBy * b;
+    Y[i]  = yv;
+    Cb[i] = b - yv;
+    Cr[i] = r - yv;
+}
+
+// Separable Gaussian, one axis per launch. horizontal != 0 -> blur along x.
+// Clamps at the border (matches the CPU edge handling).
+__global__ void GaussianBlurAxisKernel(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int width, int height,
+    const float* __restrict__ w, int radius, int horizontal)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    float sum = 0.0f;
+    for (int t = -radius; t <= radius; ++t) {
+        int xi = x, yi = y;
+        if (horizontal) { xi = x + t; if (xi < 0) xi = 0; else if (xi >= width)  xi = width  - 1; }
+        else            { yi = y + t; if (yi < 0) yi = 0; else if (yi >= height) yi = height - 1; }
+        sum += src[size_t(yi) * size_t(width) + size_t(xi)] * w[t + radius];
+    }
+    dst[size_t(y) * size_t(width) + size_t(x)] = sum;
+}
+
+// 5x5 edge-preserving bilateral on a single plane. Spatial + range weights
+// computed directly (the CPU LUTs the range; direct expf is marginally more
+// accurate and the difference is far below a code value).
+__global__ void Bilateral5x5Kernel(
+    const float* __restrict__ src, float* __restrict__ dst,
+    int width, int height, float invSp2, float invRn2)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const float c = src[size_t(y) * size_t(width) + size_t(x)];
+    float wsum = 0.0f, vsum = 0.0f;
+    for (int dy = -2; dy <= 2; ++dy) {
+        int yi = y + dy;
+        if (yi < 0) yi = 0; else if (yi >= height) yi = height - 1;
+        for (int dx = -2; dx <= 2; ++dx) {
+            int xi = x + dx;
+            if (xi < 0) xi = 0; else if (xi >= width) xi = width - 1;
+            const float v = src[size_t(yi) * size_t(width) + size_t(xi)];
+            float dv = v - c;
+            const float ws = __expf(-float(dx*dx + dy*dy) * invSp2);
+            const float wr = __expf(-dv * dv * invRn2);
+            const float wgt = ws * wr;
+            wsum += wgt;
+            vsum += wgt * v;
+        }
+    }
+    dst[size_t(y) * size_t(width) + size_t(x)] = (wsum > 0.0f) ? (vsum / wsum) : c;
+}
+
+__global__ void CombineYCbCrKernel(
+    float* __restrict__ rgb,
+    const float* __restrict__ Y, const float* __restrict__ Cb, const float* __restrict__ Cr,
+    int width, int height)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const size_t i = size_t(y) * size_t(width) + size_t(x);
+    const float yv = Y[i], cb = Cb[i], cr = Cr[i];
+    const float r = yv + cr;
+    const float b = yv + cb;
+    const float g = (yv - kDnRy * r - kDnBy * b) / kDnGy;
+    rgb[i*3 + 0] = r;
+    rgb[i*3 + 1] = g;
+    rgb[i*3 + 2] = b;
+}
+
+// ============================================================================
 // Kernel 1b: ApplyLensShading  -  per-pixel bilinear LSM gain multiply
 // (matches Debayer.cpp::ApplyLensShading; same channel-first layout)
 //
@@ -550,6 +686,76 @@ bool MaybeApplyLut3D(const BayerPipelineConstants& C, int W, int H,
     const float invSpan = 1.0f / (sHi - sLo);
     ApplyLut3DKernel<<<grid, block>>>(gRgbFloat, W, H, gLutTex, gLutN,
                                       K, sLo, invSpan);
+    return cudaGetLastError() == cudaSuccess;
+}
+
+// Host copy of Denoise.cpp::GaussianKernel — builds a normalised 1D Gaussian
+// covering ~3 sigma each side (radius capped at kDnMaxRadius). Returns the
+// weights and sets `radius`. radius 0 (sigma < 0.05) means a no-op {1.0}.
+std::vector<float> BuildGaussianKernel(float sigma, int& radius) {
+    if (sigma < 0.05f) { radius = 0; return {1.0f}; }
+    radius = std::max(1, int(std::ceil(sigma * 3.0f)));
+    if (radius > kDnMaxRadius) radius = kDnMaxRadius;
+    std::vector<float> k(size_t(radius) * 2 + 1);
+    const float inv2sig2 = 1.0f / (2.0f * sigma * sigma);
+    float sum = 0.0f;
+    for (int i = -radius; i <= radius; ++i) {
+        float v = std::exp(-float(i * i) * inv2sig2);
+        k[size_t(i + radius)] = v;
+        sum += v;
+    }
+    const float invSum = 1.0f / sum;
+    for (auto& v : k) v *= invSum;
+    return k;
+}
+
+// Phase F: output-space denoise on gRgbFloat. Caller holds gBufMutex and has
+// left output-space RGB in gRgbFloat (after matrix/LUT/rolloff). No-op when
+// both strengths are 0. Returns false on any launch/alloc error.
+bool RunDenoiseLocked(const BayerPipelineConstants& C, int W, int H,
+                      dim3 grid, dim3 block) {
+    int chroma = C.denoise_chroma, luma = C.denoise_luma;
+    if (chroma <= 0 && luma <= 0) return true;
+    if (chroma < 0) chroma = 0; else if (chroma > 100) chroma = 100;
+    if (luma   < 0) luma   = 0; else if (luma   > 100) luma   = 100;
+    if (W < 3 || H < 3) return true;
+
+    if (!EnsureDenoiseBuffers(size_t(W) * size_t(H))) return false;
+
+    SplitYCbCrKernel<<<grid, block>>>(gRgbFloat, gDnY, gDnCb, gDnCr, W, H);
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    if (chroma > 0) {
+        const float sigma = float(chroma) * 0.04f;
+        int radius = 0;
+        std::vector<float> k = BuildGaussianKernel(sigma, radius);
+        if (radius > 0) {
+            if (cudaMemcpyAsync(gDnWeights, k.data(), k.size() * sizeof(float),
+                                cudaMemcpyHostToDevice, 0) != cudaSuccess)
+                return false;
+            // Cb: H -> tmp, V -> Cb.  Cr: H -> tmp, V -> Cr.
+            GaussianBlurAxisKernel<<<grid, block>>>(gDnCb, gDnTmp, W, H, gDnWeights, radius, 1);
+            GaussianBlurAxisKernel<<<grid, block>>>(gDnTmp, gDnCb, W, H, gDnWeights, radius, 0);
+            GaussianBlurAxisKernel<<<grid, block>>>(gDnCr, gDnTmp, W, H, gDnWeights, radius, 1);
+            GaussianBlurAxisKernel<<<grid, block>>>(gDnTmp, gDnCr, W, H, gDnWeights, radius, 0);
+            if (cudaGetLastError() != cudaSuccess) return false;
+        }
+    }
+
+    const float* Yptr = gDnY;
+    if (luma > 0) {
+        const float ssig = float(luma) * 0.025f;
+        const float rsig = 0.005f + float(luma) * 0.0005f;
+        if (ssig >= 0.05f) {  // matches Bilateral5x5's early-out (memcpy)
+            const float invSp2 = 1.0f / (2.0f * ssig * ssig);
+            const float invRn2 = 1.0f / (2.0f * rsig * rsig);
+            Bilateral5x5Kernel<<<grid, block>>>(gDnY, gDnTmp, W, H, invSp2, invRn2);
+            if (cudaGetLastError() != cudaSuccess) return false;
+            Yptr = gDnTmp;  // denoised luma now in tmp
+        }
+    }
+
+    CombineYCbCrKernel<<<grid, block>>>(gRgbFloat, Yptr, gDnCb, gDnCr, W, H);
     return cudaGetLastError() == cudaSuccess;
 }
 }  // namespace
@@ -640,7 +846,9 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
             gRgbFloat, W, H, kneeStart, kneeEnd, 1.0f / (kneeEnd - kneeStart));
         if (cudaGetLastError() != cudaSuccess) return false;
     }
-    return true;
+
+    // Phase F: output-space denoise (chroma Gaussian + luma bilateral).
+    return RunDenoiseLocked(C, W, H, grid, block);
 }
 }  // namespace
 

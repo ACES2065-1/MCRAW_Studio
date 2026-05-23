@@ -291,14 +291,14 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     const bool wantDenoise = (args.format == OutputFormat::Mp4) &&
                              (args.denoiseChroma > 0 || args.denoiseLuma > 0);
 
-    // ----- Tier 2.1 Phase C.2: GPU bayer pipeline opt-in --------------------
-    // When the encoder is using Phase B's CUDA hwframe path (MCRAW_GPU_YUV=1
-    // + NVENC + supported codec), and the user didn't ask for highlight
-    // recovery or denoise (neither has a GPU kernel yet), and the output
-    // colour space has a BakedTransform — enable the full GPU bayer pipeline.
-    // Falls back silently to the CPU producer-consumer below otherwise.
+    // ----- Tier 2.1 GPU bayer pipeline opt-in -------------------------------
+    // When the encoder is on the CUDA hwframe path (MCRAW_GPU_YUV=1 + NVENC +
+    // supported pixel format/matrix), enable the full GPU bayer pipeline. The
+    // GPU now covers baked + OCIO targets (Phase C/D), 8/10-bit (E.1), BT.2020
+    // (E.2), highlight recovery (E.3) and denoise (Phase F) — so nothing here
+    // forces the CPU path. Falls back silently to the CPU producer-consumer.
     bool gpuBayerActive = false;
-    if (!wantDenoise) {
+    {
         motioncam::video::MovEncoder::GpuBayerSetup setup{};
         setup.targetColorSpace = static_cast<int>(args.colorSpace);
         std::memcpy(setup.forwardMatrix2, params0.forwardMatrix2,
@@ -309,10 +309,11 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
         setup.cfaPattern = static_cast<int>(params0.cfa);
         // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
         setup.ocioColorSpace = csInfo.ocioName;
-        // Phase E.3: highlight recovery now runs on the GPU, so it no longer
-        // forces the CPU pipeline.
         setup.highlightRecovery = args.highlightRecovery;
         setup.displayEncoded    = motioncam::color::IsDisplayEncoded(args.colorSpace);
+        // Denoise is MP4-only (MOV stays clean); wantDenoise already encodes that.
+        setup.denoiseChroma = wantDenoise ? args.denoiseChroma : 0;
+        setup.denoiseLuma   = wantDenoise ? args.denoiseLuma   : 0;
         gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
     }
 

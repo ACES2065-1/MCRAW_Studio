@@ -145,6 +145,12 @@ struct BayerPipelineConstants {
     // 0 = BT.709, 1 = BT.2020 NCL (Rec.2020 PQ/HLG delivery).
     int      yuv_matrix = 0;
 
+    // Phase F: output-space denoise (matches Denoise.cpp::DenoiseRgb), run at
+    // the very end of the chain before RGB->YUV. 0..100 each; 0 = off.
+    // chroma = separable Gaussian on Cb/Cr, luma = 5x5 bilateral on Y.
+    int      denoise_chroma = 0;
+    int      denoise_luma   = 0;
+
     // Optional lens-shading map. If lsm_w > 0 && lsm_h > 0 && lsm_host is
     // non-null, the kernel multiplies each bayer pixel by the bilinearly
     // sampled gain from lsm_host[cfa_to_lsm[idx]] grid. lsm_host points to
