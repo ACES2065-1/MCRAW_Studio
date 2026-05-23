@@ -227,6 +227,14 @@ CASES = [
          expect_streams=["video", "audio"],
          colorspace="rec2020-pq", codec="h265_nvenc", start=0, end=8,
          bitrate=60, ten_bit=True),
+
+    # AV1 NVENC (RTX 40-series+). Same GPU NV12/P010 path as HEVC; this case
+    # guards the AV1-specific encoder wiring. Will fail on GPUs without AV1
+    # NVENC — that's expected, like the other nvenc cases need an NVIDIA GPU.
+    Case("mp4_av1nvenc_srgb",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="srgb", codec="av1_nvenc", start=0, end=8, bitrate=30),
 ]
 
 
