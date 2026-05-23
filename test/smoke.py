@@ -194,6 +194,14 @@ CASES = [
          expect_streams=["video", "audio"],
          colorspace="srgb", codec="h264", start=0, end=8, bitrate=20,
          highlight_recovery=True),
+
+    # OCIO target via NVENC — exercises the Phase D GPU 3D-LUT path when
+    # MCRAW_GPU_YUV=1, and the OCIO CPU processor otherwise. 8-bit so the
+    # GPU NV12 fast path is eligible.
+    Case("mp4_h265nvenc_acescct",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="acescct", codec="h265_nvenc", start=0, end=8, bitrate=40),
 ]
 
 

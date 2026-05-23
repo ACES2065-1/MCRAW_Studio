@@ -98,6 +98,11 @@ struct BayerPipelineConstants {
     int      width;
     int      height;
 
+    // Phase D: when non-zero, run the uploaded ACEScg->target 3D LUT after
+    // the cam_to_output matrix (which must then be cam->ACEScg, curve None).
+    // Requires a prior successful SetupLut3D(). Ignored if no LUT is loaded.
+    int      use_lut3d = 0;
+
     // Optional lens-shading map. If lsm_w > 0 && lsm_h > 0 && lsm_host is
     // non-null, the kernel multiplies each bayer pixel by the bilinearly
     // sampled gain from lsm_host[cfa_to_lsm[idx]] grid. lsm_host points to
@@ -134,6 +139,10 @@ bool ProcessBayerToRgb(
 // instead of copying the result to host, hands the GPU RGB straight to
 // the Phase B RGB->NV12 kernel and writes the result into the caller-
 // supplied NVENC hwframe Y/UV device pointers. No host roundtrip.
+//
+// When a 3D LUT has been uploaded via SetupLut3D() AND consts.use_lut3d is
+// non-zero, an extra ACEScg->target LUT step runs after the matrix
+// (consts.cam_to_output should then be cam->ACEScg with curve == None).
 bool ProcessBayerToNv12(
     const uint16_t* bayer_host,
     const float wb[3],
@@ -142,6 +151,36 @@ bool ProcessBayerToNv12(
     void* uv_device,
     int   y_pitch_bytes,
     int   uv_pitch_bytes);
+
+// ---------- Phase D: OCIO on GPU via 3D LUT -----------------------------
+//
+// OCIO-only output targets (ACEScct, S-Log3, DaVinci Intermediate, Rec.2020
+// PQ/HLG, ...) have no baked matrix+curve. Instead we bake the OCIO
+// ACEScg->target transform into a kLutSize^3 float RGB cube on the host
+// (see color::BakeAcesCgToTargetLut3D) and sample it on the GPU.
+//
+// The cube is addressed through an asinh "shaper" that maps ACEScg
+// scene-linear (unbounded, can go slightly negative) into the LUT's [0,1]
+// domain: linear near black so sub-black survives, log-like in the
+// highlights so HDR compresses. These constants are shared by the host bake
+// and the device sampler so the two stay in lockstep.
+constexpr int   kLutSize     = 65;
+constexpr float kLutShaperK  = 0.01f;   // toe width (linear region ~ |L| < K)
+constexpr float kLutShaperLo = -0.35f;  // ACEScg value mapped to t = 0
+constexpr float kLutShaperHi = 64.0f;   // ACEScg value mapped to t = 1
+
+// Upload an n^3 float LUT. `lut_rgba_host` is n*n*n*4 floats, RGBA, with the
+// B axis fastest-varying: index = ((iR*n + iG)*n + iB)*4 (matches
+// color::BakeAcesCgToTargetLut3D). The alpha channel is ignored. Allocates a
+// cudaArray + texture object with hardware trilinear filtering and replaces
+// any previously uploaded LUT. Returns false on any CUDA error.
+bool SetupLut3D(const float* lut_rgba_host, int n);
+
+// True once a LUT has been successfully uploaded.
+bool HasLut3D();
+
+// Free the LUT cudaArray + texture object. Call at encoder destruction.
+void ReleaseLut3D();
 
 }
 }

@@ -91,10 +91,11 @@ public:
     //      WriteVideoFrame(). The encoder owns the entire processing
     //      chain from raw bayer to NVENC-encoded packet.
     struct GpuBayerSetup {
-        // OutputColorSpace value cast to int. Must be a BakedTransform-
-        // compatible target (ACEScg / LinearRec709 / ACES2065-1 /
-        // Rec709Gamma22 / Rec709Display / SRGB). Anything else makes
-        // EnableGpuBayerPipeline return false.
+        // OutputColorSpace value cast to int. A BakedTransform target
+        // (ACEScg / LinearRec709 / ACES2065-1 / Rec709Gamma22 /
+        // Rec709Display / SRGB) runs entirely as matrix + curve. An
+        // OCIO-only target (ACEScct / S-Log3 / DaVinci / Rec.2020 PQ-HLG /
+        // ...) instead bakes a 3D LUT — see ocioColorSpace below.
         int      targetColorSpace;
 
         // From container metadata. ForwardMatrix2 is DNG's camera->XYZ_D50
@@ -105,6 +106,14 @@ public:
         uint16_t blackPerPosition[4];
         double   whiteLevel;
         int      cfaPattern;
+
+        // Phase D: OCIO config colour-space name (e.g. "ACEScct"). Only
+        // consulted when targetColorSpace has no BakedTransform — then the
+        // encoder bakes an ACEScg->target 3D LUT and runs it on the GPU
+        // after the cam->ACEScg matrix. Leave empty for baked targets; an
+        // empty name on a non-baked target makes EnableGpuBayerPipeline
+        // fall back to the CPU pipeline.
+        std::string ocioColorSpace;
     };
 
     bool EnableGpuBayerPipeline(const GpuBayerSetup& setup);

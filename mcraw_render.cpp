@@ -307,6 +307,8 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
             setup.blackPerPosition[i] = params0.blackPerPosition[i];
         setup.whiteLevel = params0.whiteLevel;
         setup.cfaPattern = static_cast<int>(params0.cfa);
+        // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
+        setup.ocioColorSpace = csInfo.ocioName;
         gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
     }
 

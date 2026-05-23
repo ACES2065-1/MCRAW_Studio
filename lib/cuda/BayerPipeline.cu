@@ -21,6 +21,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 
@@ -45,6 +46,22 @@ float*       gLsmDevice  = nullptr;
 int          gLsmW       = 0;
 int          gLsmH       = 0;
 std::mutex   gBufMutex;
+
+// Phase D: OCIO 3D LUT, uploaded once per clip via SetupLut3D(). Stored as a
+// float4 cudaArray sampled with hardware trilinear filtering. The B axis is
+// the array's fastest-varying dimension (matches the host bake layout), so
+// the kernel samples tex3D(lut, tcB, tcG, tcR).
+cudaArray_t         gLutArray = nullptr;
+cudaTextureObject_t gLutTex   = 0;
+int                 gLutN     = 0;
+bool                gLutValid = false;
+
+void ReleaseLut3DLocked() {
+    if (gLutTex)   { cudaDestroyTextureObject(gLutTex); gLutTex = 0; }
+    if (gLutArray) { cudaFreeArray(gLutArray);          gLutArray = nullptr; }
+    gLutN = 0;
+    gLutValid = false;
+}
 
 bool EnsureBuffers(int width, int height) {
     if (width == gBufW && height == gBufH &&
@@ -92,6 +109,63 @@ void ReleaseBayerPipeline() {
     gBufH = 0;
     gLsmW = 0;
     gLsmH = 0;
+}
+
+// ============================================================================
+// Phase D: 3D LUT upload / teardown
+// ============================================================================
+
+bool SetupLut3D(const float* lut_rgba_host, int n) {
+    if (!IsCudaAvailable() || !lut_rgba_host || n < 2) return false;
+    std::lock_guard<std::mutex> lock(gBufMutex);
+
+    ReleaseLut3DLocked();
+
+    cudaChannelFormatDesc ch = cudaCreateChannelDesc<float4>();
+    cudaExtent ext = make_cudaExtent(n, n, n);   // dims: B (fastest), G, R
+    cudaError_t err = cudaMalloc3DArray(&gLutArray, &ch, ext, 0);
+    if (err != cudaSuccess) { gLutArray = nullptr; return false; }
+
+    cudaMemcpy3DParms cp = {};
+    cp.srcPtr = make_cudaPitchedPtr(
+        const_cast<float*>(lut_rgba_host),
+        size_t(n) * sizeof(float4),   // row pitch (B axis * float4)
+        size_t(n),                    // width  in elements (B)
+        size_t(n));                   // height in rows     (G)
+    cp.dstArray = gLutArray;
+    cp.extent   = ext;
+    cp.kind     = cudaMemcpyHostToDevice;
+    err = cudaMemcpy3D(&cp);
+    if (err != cudaSuccess) { ReleaseLut3DLocked(); return false; }
+
+    cudaResourceDesc resDesc = {};
+    resDesc.resType = cudaResourceTypeArray;
+    resDesc.res.array.array = gLutArray;
+
+    cudaTextureDesc texDesc = {};
+    texDesc.addressMode[0] = cudaAddressModeClamp;
+    texDesc.addressMode[1] = cudaAddressModeClamp;
+    texDesc.addressMode[2] = cudaAddressModeClamp;
+    texDesc.filterMode       = cudaFilterModeLinear;   // hardware trilinear
+    texDesc.readMode         = cudaReadModeElementType; // float, no normalize
+    texDesc.normalizedCoords = 1;
+
+    err = cudaCreateTextureObject(&gLutTex, &resDesc, &texDesc, nullptr);
+    if (err != cudaSuccess) { ReleaseLut3DLocked(); return false; }
+
+    gLutN = n;
+    gLutValid = true;
+    return true;
+}
+
+bool HasLut3D() {
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    return gLutValid;
+}
+
+void ReleaseLut3D() {
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    ReleaseLut3DLocked();
 }
 
 // ============================================================================
@@ -274,6 +348,57 @@ __global__ void ApplyMatrixCurveKernel(
 }
 
 // ============================================================================
+// Kernel 4 (Phase D): ApplyLut3D  -  in-place ACEScg -> target via 3D LUT
+//
+// Replaces the curve step for OCIO-only targets. Input is ACEScg scene-linear
+// (cam_to_output was cam->ACEScg, curve None). Each channel is run through the
+// asinh shaper to get a [0,1] cube coordinate, then the float4 LUT is sampled
+// with hardware trilinear filtering. The B axis is the cube's fastest-varying
+// dimension, so the fetch order is tex3D(lut, tcB, tcG, tcR).
+//
+// shaperK / sLo / invSpan are precomputed on the host from kLutShaper*:
+//   sLo = asinh(lo/K),  invSpan = 1 / (asinh(hi/K) - sLo)
+// ============================================================================
+
+__device__ __forceinline__ float LinToShaperT(float L, float K, float sLo, float invSpan) {
+    float t = (asinhf(L / K) - sLo) * invSpan;
+    return fminf(fmaxf(t, 0.0f), 1.0f);
+}
+
+__global__ void ApplyLut3DKernel(
+    float* __restrict__ rgb,
+    int width, int height,
+    cudaTextureObject_t lut, int n,
+    float shaperK, float sLo, float invSpan)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const size_t o = (size_t(y) * size_t(width) + size_t(x)) * 3;
+    const float R = rgb[o + 0];
+    const float G = rgb[o + 1];
+    const float B = rgb[o + 2];
+
+    const float tR = LinToShaperT(R, shaperK, sLo, invSpan);
+    const float tG = LinToShaperT(G, shaperK, sLo, invSpan);
+    const float tB = LinToShaperT(B, shaperK, sLo, invSpan);
+
+    // [0,1] grid coordinate -> normalized texture coordinate with the
+    // half-texel offset so t = i/(n-1) lands on texel center (i+0.5)/n.
+    const float scale = float(n - 1) / float(n);
+    const float bias  = 0.5f / float(n);
+    const float u = tB * scale + bias;   // array dim 0 (fastest) = B
+    const float v = tG * scale + bias;   // array dim 1            = G
+    const float w = tR * scale + bias;   // array dim 2 (slowest)  = R
+
+    const float4 c = tex3D<float4>(lut, u, v, w);
+    rgb[o + 0] = c.x;
+    rgb[o + 1] = c.y;
+    rgb[o + 2] = c.z;
+}
+
+// ============================================================================
 // Kernel 1b: ApplyLensShading  -  per-pixel bilinear LSM gain multiply
 // (matches Debayer.cpp::ApplyLensShading; same channel-first layout)
 //
@@ -334,6 +459,23 @@ __global__ void ApplyLensShadingKernel(
 // ============================================================================
 // Phase C orchestrator
 // ============================================================================
+
+// Phase D: optional ACEScg->target 3D LUT after the matrix. Caller must hold
+// gBufMutex and have just left ACEScg in gRgbFloat. Returns false only on a
+// kernel launch error; a no-op (LUT disabled / not loaded) returns true.
+namespace {
+bool MaybeApplyLut3D(const BayerPipelineConstants& C, int W, int H,
+                     dim3 grid, dim3 block) {
+    if (!C.use_lut3d || !gLutValid) return true;
+    const float K       = kLutShaperK;
+    const float sLo     = std::asinh(kLutShaperLo / K);
+    const float sHi     = std::asinh(kLutShaperHi / K);
+    const float invSpan = 1.0f / (sHi - sLo);
+    ApplyLut3DKernel<<<grid, block>>>(gRgbFloat, W, H, gLutTex, gLutN,
+                                      K, sLo, invSpan);
+    return cudaGetLastError() == cudaSuccess;
+}
+}  // namespace
 
 bool ProcessBayerToRgb(
     const uint16_t* bayer_host,
@@ -423,6 +565,9 @@ bool ProcessBayerToRgb(
         C.curve);
     err = cudaGetLastError();
     if (err != cudaSuccess) return false;
+
+    // 4b. Phase D: optional ACEScg->target 3D LUT (OCIO targets).
+    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
 
     // 5. Copy result to host for verification (Phase C.1 only, used by
     //    the Python correctness binding). Phase C.2's ProcessBayerToNv12
@@ -526,6 +671,9 @@ bool ProcessBayerToNv12(
         C.curve);
     err = cudaGetLastError();
     if (err != cudaSuccess) return false;
+
+    // Phase D: optional ACEScg->target 3D LUT (OCIO targets) before NV12.
+    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
 
     // Chain straight into the Phase B NV12 converter. RgbFloatToNv12FromDevice
     // launches its own kernel + cudaDeviceSynchronize, so we don't need

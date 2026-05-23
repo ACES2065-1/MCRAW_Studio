@@ -12,6 +12,8 @@ extern "C" {
 
 #if MCRAW_HAVE_CUDA
 #include <motioncam/CudaHwHandoff.hpp>
+#include <motioncam/OcioTransform.hpp>   // Phase D: bake OCIO ACEScg->target LUT
+#include <vector>
 #endif
 
 #include <cstdlib>
@@ -546,6 +548,10 @@ MovEncoder::~MovEncoder() {
     if (p->useCudaDirectKernel) {
         motioncam::cuda::ReleaseRgbScratch();
     }
+    // Phase D: free the clip-specific OCIO 3D LUT (no-op if none loaded).
+    if (p->useGpuBayerPipeline) {
+        motioncam::cuda::ReleaseLut3D();
+    }
 #endif
     if (p->pkt) av_packet_free(&p->pkt);
     if (p->fmt) {
@@ -948,18 +954,50 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
     // codec / output combo isn't supported), Phase C can't run either.
     if (!p->useCudaDirectKernel) return false;
 
-    // Build the combined cam -> target matrix and the curve code.
+    // Build the combined cam -> target matrix and the curve code. If the
+    // target has no BakedTransform, fall back to the Phase D path: cam ->
+    // ACEScg matrix followed by an OCIO-baked 3D LUT.
     float fullMatrix[9];
-    int curve = 0;
+    int   curve = 0;
+    bool  useLut = false;
     if (!BuildBakedCamToOutput(setup.targetColorSpace,
                                 setup.forwardMatrix2,
                                 fullMatrix, curve)) {
-        fprintf(stderr,
-            "[MovEncoder] Phase C bayer pipeline: target colourspace %d "
-            "isn't BakedTransform-compatible; staying on the CPU bayer "
-            "pipeline (Phase B's RGB->NV12 still runs on the GPU).\n",
-            setup.targetColorSpace);
-        return false;
+        // Not bake-compatible. Try Phase D (OCIO 3D LUT) if the caller
+        // supplied an OCIO colour-space name.
+        if (setup.ocioColorSpace.empty()) {
+            fprintf(stderr,
+                "[MovEncoder] Phase C/D: target colourspace %d has no "
+                "BakedTransform and no OCIO name supplied; staying on the "
+                "CPU bayer pipeline (Phase B RGB->NV12 still on GPU).\n",
+                setup.targetColorSpace);
+            return false;
+        }
+        // cam -> ACEScg base matrix (case 0 = ACEScg, curve None).
+        if (!BuildBakedCamToOutput(0, setup.forwardMatrix2, fullMatrix, curve)) {
+            return false;  // unreachable: ACEScg is always bake-compatible
+        }
+        curve = 0;
+        try {
+            std::vector<float> lut = motioncam::color::BakeAcesCgToTargetLut3D(
+                setup.ocioColorSpace,
+                motioncam::cuda::kLutSize,
+                motioncam::cuda::kLutShaperK,
+                motioncam::cuda::kLutShaperLo,
+                motioncam::cuda::kLutShaperHi);
+            if (!motioncam::cuda::SetupLut3D(lut.data(), motioncam::cuda::kLutSize)) {
+                fprintf(stderr,
+                    "[MovEncoder] Phase D: SetupLut3D failed for '%s'; "
+                    "CPU bayer pipeline.\n", setup.ocioColorSpace.c_str());
+                return false;
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[MovEncoder] Phase D: LUT bake failed for '%s' (%s); "
+                "CPU bayer pipeline.\n", setup.ocioColorSpace.c_str(), e.what());
+            return false;
+        }
+        useLut = true;
     }
 
     int chMap[4], cfaToLsm[4];
@@ -974,17 +1012,26 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
         C.cfa_channel[i]  = chMap[i];
         C.cfa_to_lsm[i]   = cfaToLsm[i];
     }
-    C.curve  = curve;
-    C.width  = p->settings.width;
-    C.height = p->settings.height;
+    C.curve     = curve;
+    C.width     = p->settings.width;
+    C.height    = p->settings.height;
+    C.use_lut3d = useLut ? 1 : 0;
     C.lsm_w  = 0;
     C.lsm_h  = 0;
     C.lsm_host = nullptr;
 
     p->useGpuBayerPipeline = true;
-    fprintf(stderr,
-        "[MovEncoder] Phase C bayer pipeline enabled (target=%d, curve=%d).\n",
-        setup.targetColorSpace, curve);
+    if (useLut) {
+        fprintf(stderr,
+            "[MovEncoder] Phase D bayer+LUT pipeline enabled "
+            "(target=%d, OCIO '%s', %d^3 LUT).\n",
+            setup.targetColorSpace, setup.ocioColorSpace.c_str(),
+            motioncam::cuda::kLutSize);
+    } else {
+        fprintf(stderr,
+            "[MovEncoder] Phase C bayer pipeline enabled (target=%d, curve=%d).\n",
+            setup.targetColorSpace, curve);
+    }
     return true;
 #else
     (void)setup;

@@ -386,6 +386,8 @@ static void DoRender(
                 setup.blackPerPosition[i] = params0.blackPerPosition[i];
             setup.whiteLevel = params0.whiteLevel;
             setup.cfaPattern = static_cast<int>(params0.cfa);
+            // OCIO targets (no BakedTransform) take the Phase D GPU 3D-LUT path.
+            setup.ocioColorSpace = csInfo.ocioName;
             gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
         }
 
@@ -943,6 +945,128 @@ codec (mov only): prores422, prores422hq, prores4444, prores4444xq, h264, h265
         "Phase C.1 GPU bayer pipeline (normalise + debayer + cam-to-output "
         "matrix + optional curve). Returns float32 (H, W, 3) RGB in the "
         "target colour space. For correctness testing against process_frame.");
+
+    // Phase D correctness test. Runs the GPU bayer pipeline with the OCIO
+    // 3D-LUT step (normalise + debayer + cam->ACEScg matrix + asinh-shaped
+    // 3D LUT) on a single frame and returns (H, W, 3) float32 in the target
+    // OCIO space — same shape as process_frame, so the test script can
+    // subtract the two and confirm the GPU LUT matches the OCIO CPU path.
+    m.def("cuda_process_frame_phase_d",
+        [](PyDecoder& pyDec, int64_t timestamp,
+           const std::string& target_colorspace) -> py::array_t<float> {
+            mc::Decoder& dec = *pyDec.underlying();
+
+            mcc::OutputColorSpace cs;
+            if (!mcc::ParseOutputColorSpace(target_colorspace, cs)) {
+                throw std::runtime_error("unknown colorspace: " + target_colorspace);
+            }
+            const auto& info = mcc::GetInfo(cs);
+            if (!info.requiresOcio) {
+                throw std::runtime_error(
+                    target_colorspace + " is not an OCIO target (use "
+                    "cuda_process_frame_phase_c for baked targets).");
+            }
+
+            std::vector<uint8_t> rawBuf;
+            nlohmann::json frameMeta;
+            uint32_t width = 0, height = 0;
+            mcc::FrameParams params;
+            {
+                py::gil_scoped_release release;
+                dec.loadFrame(timestamp, rawBuf, frameMeta);
+                params = mcc::BuildFrameParams(frameMeta, dec.getContainerMetadata());
+                width = params.width;
+                height = params.height;
+            }
+
+            // cam -> ACEScg (AP1). Same chain as the baked binding above, but
+            // we stop at ACEScg and let the 3D LUT carry ACEScg -> target.
+            constexpr float Bradford_D50_to_D60[9] = {
+                 0.96766f, -0.01686f,  0.04424f,
+                -0.02099f,  1.00778f,  0.01477f,
+                 0.00853f, -0.01415f,  1.22963f,
+            };
+            constexpr float XYZ_D60_to_AP1[9] = {
+                 1.6410233797f, -0.3248032942f, -0.2364246952f,
+                -0.6636628587f,  1.6153315917f,  0.0167563477f,
+                 0.0117218943f, -0.0082844420f,  0.9883948585f,
+            };
+            auto matMul = [](const float A[9], const float B[9], float out[9]) {
+                for (int i = 0; i < 3; ++i)
+                    for (int j = 0; j < 3; ++j)
+                        out[i*3+j] = A[i*3+0]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+            };
+            float tmp[9], camToAcescg[9];
+            matMul(Bradford_D50_to_D60, params.forwardMatrix2, tmp);
+            matMul(XYZ_D60_to_AP1, tmp, camToAcescg);
+
+            // CFA channel + LSM maps (same as the baked binding).
+            int chMap[4], cfaToLsm[4];
+            switch (params.cfa) {
+                case mcc::CfaPattern::RGGB:
+                    chMap[0]=0; chMap[1]=1; chMap[2]=1; chMap[3]=2;
+                    cfaToLsm[0]=0; cfaToLsm[1]=1; cfaToLsm[2]=2; cfaToLsm[3]=3; break;
+                case mcc::CfaPattern::BGGR:
+                    chMap[0]=2; chMap[1]=1; chMap[2]=1; chMap[3]=0;
+                    cfaToLsm[0]=3; cfaToLsm[1]=2; cfaToLsm[2]=1; cfaToLsm[3]=0; break;
+                case mcc::CfaPattern::GRBG:
+                    chMap[0]=1; chMap[1]=0; chMap[2]=2; chMap[3]=1;
+                    cfaToLsm[0]=1; cfaToLsm[1]=0; cfaToLsm[2]=3; cfaToLsm[3]=2; break;
+                case mcc::CfaPattern::GBRG:
+                    chMap[0]=1; chMap[1]=2; chMap[2]=0; chMap[3]=1;
+                    cfaToLsm[0]=2; cfaToLsm[1]=3; cfaToLsm[2]=0; cfaToLsm[3]=1; break;
+            }
+
+            // Bake the OCIO ACEScg->target cube and upload it.
+            {
+                py::gil_scoped_release release;
+                std::vector<float> lut = mcc::BakeAcesCgToTargetLut3D(
+                    info.ocioName, motioncam::cuda::kLutSize,
+                    motioncam::cuda::kLutShaperK,
+                    motioncam::cuda::kLutShaperLo,
+                    motioncam::cuda::kLutShaperHi);
+                if (!motioncam::cuda::SetupLut3D(lut.data(), motioncam::cuda::kLutSize)) {
+                    throw std::runtime_error("SetupLut3D failed");
+                }
+            }
+
+            motioncam::cuda::BayerPipelineConstants C{};
+            std::memcpy(C.cam_to_output, camToAcescg, sizeof(camToAcescg));
+            for (int i = 0; i < 4; ++i) {
+                C.black[i] = params.blackPerPosition[i];
+                double denom = params.whiteLevel - double(params.blackPerPosition[i]);
+                C.inv_range[i] = denom > 0.0 ? float(1.0 / denom) : 0.0f;
+                C.cfa_channel[i] = chMap[i];
+                C.cfa_to_lsm[i]  = cfaToLsm[i];
+            }
+            C.curve     = 0;          // ACEScg is linear; LUT does the rest
+            C.width     = int(width);
+            C.height    = int(height);
+            C.use_lut3d = 1;
+            if (!params.lensShadingMap.empty() &&
+                params.lsmWidth >= 2 && params.lsmHeight >= 2) {
+                C.lsm_w    = int(params.lsmWidth);
+                C.lsm_h    = int(params.lsmHeight);
+                C.lsm_host = params.lensShadingMap.data();
+            } else {
+                C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr;
+            }
+
+            py::array_t<float> arr({ int(height), int(width), 3 });
+            {
+                py::gil_scoped_release release;
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
+                bool ok = motioncam::cuda::ProcessBayerToRgb(
+                    raw, params.asShotNeutral, C, arr.mutable_data());
+                motioncam::cuda::ReleaseLut3D();
+                if (!ok) throw std::runtime_error("ProcessBayerToRgb (LUT) kernel failed");
+            }
+            return arr;
+        },
+        py::arg("decoder"), py::arg("timestamp"), py::arg("target_colorspace"),
+        "Phase D GPU bayer pipeline with OCIO 3D LUT. Returns float32 "
+        "(H, W, 3) RGB in the target OCIO space. For correctness testing "
+        "against process_frame.");
 #endif
 
     m.def("encoder_available", [](const std::string& name) -> bool {
