@@ -202,6 +202,14 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="acescct", codec="h265_nvenc", start=0, end=8, bitrate=40),
+
+    # 10-bit Main10 via NVENC — exercises the Phase E.1 GPU P010 kernel when
+    # MCRAW_GPU_YUV=1, the CPU sws->P010 path otherwise.
+    Case("mp4_h265nvenc_acescg_10bit",
+         output_ext=".mp4",
+         expect_streams=["video", "audio"],
+         colorspace="acescg", codec="h265_nvenc", start=0, end=8, bitrate=60,
+         ten_bit=True),
 ]
 
 

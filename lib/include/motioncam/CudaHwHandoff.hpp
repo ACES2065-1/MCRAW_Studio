@@ -80,6 +80,30 @@ bool RgbFloatToNv12FromDevice(
     int   y_pitch_bytes,
     int   uv_pitch_bytes);
 
+// ---------- Phase E.1: RGB float -> P010 (BT.709 limited, 10-bit) -------
+//
+// 10-bit siblings of the NV12 converters. Output is P010: 16-bit samples
+// with the 10-bit value in the high bits (value << 6), Y plane + interleaved
+// UV, 4:2:0, BT.709 limited range. y_device / uv_device are the P010 hwframe
+// planes (AVFrame data[0/1]); pitches are linesize[0/1] in bytes.
+bool RgbFloatToP010(
+    const float* rgb_host,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
+
+bool RgbFloatToP010FromDevice(
+    const void* rgb_device,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
+
 // ---------- Phase C: bayer -> RGB on GPU --------------------------------
 //
 // Per-clip constants (built once when the encoder starts, identical across
@@ -144,6 +168,18 @@ bool ProcessBayerToRgb(
 // non-zero, an extra ACEScg->target LUT step runs after the matrix
 // (consts.cam_to_output should then be cam->ACEScg with curve == None).
 bool ProcessBayerToNv12(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    void* y_device,
+    void* uv_device,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes);
+
+// Phase E.1: 10-bit sibling of ProcessBayerToNv12. Runs the same bayer
+// chain (incl. optional 3D LUT) then writes P010 instead of NV12, for
+// Main10 NVENC output. y_device / uv_device are the P010 hwframe planes.
+bool ProcessBayerToP010(
     const uint16_t* bayer_host,
     const float wb[3],
     const BayerPipelineConstants& consts,

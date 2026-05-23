@@ -186,6 +186,71 @@ __global__ void RgbFloatToNv12Kernel(
     }
 }
 
+// ---------- Phase E.1: RGB float -> P010 (BT.709 limited, 10-bit) ----------
+//
+// P010 is NV12's 10-bit sibling: 16-bit samples with the 10-bit value stored
+// in the *high* 10 bits (value << 6, low 6 bits zero). Same plane layout
+// (Y plane + interleaved UV, 4:2:0). The BT.709 limited-range code values are
+// simply 4x the 8-bit ones: Y' in [64,940], Cb/Cr in [64,960] centred 512.
+//
+//   Y10 = Yf*876 + 64        (876 = 219*4, 64 = 16*4)
+//   Cb10 = Cb*896 + 512      (896 = 224*4, 512 = 128*4)
+//   Cr10 = Cr*896 + 512
+//
+// Planes are passed as byte pointers + byte pitches (AVFrame data/linesize),
+// cast to uint16_t per row.
+
+__device__ __forceinline__ uint16_t ClampTo10Shifted(float x) {
+    int v = int(x + 0.5f);
+    if (v < 0) v = 0; else if (v > 1023) v = 1023;
+    return uint16_t(v << 6);
+}
+
+__global__ void RgbFloatToP010Kernel(
+    const float* __restrict__ rgb,
+    uint8_t*     __restrict__ yPlaneBytes,   // byte base, pitch in bytes
+    uint8_t*     __restrict__ uvPlaneBytes,
+    int width, int height,
+    int yPitch, int uvPitch)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const float* px = rgb + (size_t(y) * size_t(width) + size_t(x)) * 3;
+    float R = __saturatef(px[0]);
+    float G = __saturatef(px[1]);
+    float B = __saturatef(px[2]);
+
+    const float Y_full = 0.2126f * R + 0.7152f * G + 0.0722f * B;
+    const float Y10    = Y_full * 876.0f + 64.0f;
+    uint16_t* yRow = reinterpret_cast<uint16_t*>(yPlaneBytes + size_t(y) * size_t(yPitch));
+    yRow[x] = ClampTo10Shifted(Y10);
+
+    if ((x & 1) == 0 && (y & 1) == 0) {
+        const int yx2 = (x + 1 < width)  ? x + 1 : x;
+        const int yy2 = (y + 1 < height) ? y + 1 : y;
+        const float* p00 = rgb + (size_t(y  ) * size_t(width) + size_t(x  )) * 3;
+        const float* p01 = rgb + (size_t(y  ) * size_t(width) + size_t(yx2)) * 3;
+        const float* p10 = rgb + (size_t(yy2) * size_t(width) + size_t(x  )) * 3;
+        const float* p11 = rgb + (size_t(yy2) * size_t(width) + size_t(yx2)) * 3;
+        float Ra = __saturatef((p00[0] + p01[0] + p10[0] + p11[0]) * 0.25f);
+        float Ga = __saturatef((p00[1] + p01[1] + p10[1] + p11[1]) * 0.25f);
+        float Ba = __saturatef((p00[2] + p01[2] + p10[2] + p11[2]) * 0.25f);
+
+        const float Cb = -0.114572f * Ra - 0.385428f * Ga + 0.5f      * Ba;
+        const float Cr =  0.5f      * Ra - 0.454153f * Ga - 0.045847f * Ba;
+        const float Cb10 = Cb * 896.0f + 512.0f;
+        const float Cr10 = Cr * 896.0f + 512.0f;
+
+        const int uvx = x >> 1;
+        const int uvy = y >> 1;
+        uint16_t* uvRow = reinterpret_cast<uint16_t*>(uvPlaneBytes + size_t(uvy) * size_t(uvPitch));
+        uvRow[uvx * 2 + 0] = ClampTo10Shifted(Cb10);
+        uvRow[uvx * 2 + 1] = ClampTo10Shifted(Cr10);
+    }
+}
+
 }  // namespace
 
 bool RgbFloatToNv12(
@@ -259,6 +324,76 @@ bool RgbFloatToNv12FromDevice(
               (height + block.y - 1) / block.y);
 
     RgbFloatToNv12Kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(rgb_device),
+        static_cast<uint8_t*>(y_device),
+        static_cast<uint8_t*>(uv_device),
+        width, height,
+        y_pitch_bytes, uv_pitch_bytes);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+    err = cudaDeviceSynchronize();
+    return err == cudaSuccess;
+}
+
+// ---------- Phase E.1: P010 host wrappers (mirror the NV12 ones) ----------
+
+bool RgbFloatToP010(
+    const float* rgb_host,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes)
+{
+    if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
+    if (!rgb_host || !y_device || !uv_device) return false;
+
+    const size_t pixels   = size_t(width) * size_t(height);
+    const size_t rgbBytes = pixels * 3 * sizeof(float);
+
+    std::lock_guard<std::mutex> lock(gRgbScratchMutex);
+    if (!EnsureRgbScratch(rgbBytes)) return false;
+
+    cudaError_t err = cudaMemcpyAsync(
+        gRgbScratch, rgb_host, rgbBytes, cudaMemcpyHostToDevice, 0);
+    if (err != cudaSuccess) return false;
+
+    dim3 block(32, 8);
+    dim3 grid((width + block.x - 1) / block.x,
+              (height + block.y - 1) / block.y);
+
+    RgbFloatToP010Kernel<<<grid, block>>>(
+        gRgbScratch,
+        static_cast<uint8_t*>(y_device),
+        static_cast<uint8_t*>(uv_device),
+        width, height,
+        y_pitch_bytes, uv_pitch_bytes);
+
+    err = cudaGetLastError();
+    if (err != cudaSuccess) return false;
+    err = cudaDeviceSynchronize();
+    return err == cudaSuccess;
+}
+
+bool RgbFloatToP010FromDevice(
+    const void* rgb_device,
+    void* y_device,
+    void* uv_device,
+    int   width,
+    int   height,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes)
+{
+    if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
+    if (!rgb_device || !y_device || !uv_device) return false;
+
+    dim3 block(32, 8);
+    dim3 grid((width  + block.x - 1) / block.x,
+              (height + block.y - 1) / block.y);
+
+    RgbFloatToP010Kernel<<<grid, block>>>(
         reinterpret_cast<const float*>(rgb_device),
         static_cast<uint8_t*>(y_device),
         static_cast<uint8_t*>(uv_device),

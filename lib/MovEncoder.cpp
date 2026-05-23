@@ -137,10 +137,13 @@ struct MovEncoder::Impl {
     AVBufferRef* hwFramesCtx = nullptr;
     bool useCudaUpload = false;
     // Phase B sub-path. True iff the kernel supports the current output
-    // (8-bit NV12 / BT.709 limited). False -> CUDA path is disabled and
-    // we use the regular CPU YUV pipeline (Phase B doesn't cover Rec.2020
-    // or 10-bit yet — those land in a follow-up patch).
+    // (BT.709 limited, NV12 or P010). False -> CUDA path is disabled and
+    // we use the regular CPU YUV pipeline (the kernels don't cover the
+    // BT.2020 NCL matrix yet — that lands in Phase E.2).
     bool useCudaDirectKernel = false;
+    // Phase E.1: true when the hwframe is 10-bit P010 (vs 8-bit NV12). The
+    // RGB->YUV step then uses the P010 kernel.
+    bool useCudaP010 = false;
 
     // Phase C.2 state. When useGpuBayerPipeline is true the caller passes
     // bayer + WB + LSM via WriteVideoFrameFromBayer and the encoder runs
@@ -359,19 +362,19 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
         const bool envOptIn = envOpt && std::strcmp(envOpt, "1") == 0;
 
         if (isNvencCodec && envOptIn && motioncam::cuda::IsCudaAvailable()) {
-            // Phase B kernel-supported check. The direct RGB->NV12 kernel
-            // only handles 8-bit BT.709 / unspecified at the moment.
-            // Other cases (10-bit P010, BT.2020 matrix for Rec.2020 PQ/HLG
-            // delivery) silently keep the CPU YUV pipeline — correctness
-            // first, more kernels in a follow-up patch.
-            const bool is8bit = (p->videoCtx->pix_fmt == AV_PIX_FMT_YUV420P);
+            // Kernel-supported check. The RGB->YUV kernels handle 8-bit NV12
+            // and 10-bit P010, both BT.709 limited. The BT.2020 NCL matrix
+            // (Rec.2020 PQ/HLG delivery) still keeps the CPU YUV pipeline
+            // until Phase E.2.
+            const bool is8bit  = (p->videoCtx->pix_fmt == AV_PIX_FMT_YUV420P);
+            const bool is10bit = (p->videoCtx->pix_fmt == AV_PIX_FMT_P010LE);
             const bool bt709Compat = (s.colorMatrix == 1 || s.colorMatrix == 2);
-            if (!is8bit || !bt709Compat) {
+            if ((!is8bit && !is10bit) || !bt709Compat) {
                 fprintf(stderr,
                     "[MovEncoder] CUDA path requested but output is "
                     "%s%s — using CPU YUV.\n",
-                    !is8bit ? "10-bit" : "",
-                    !bt709Compat ? " / BT.2020" : "");
+                    (!is8bit && !is10bit) ? "an unsupported pixel format" : "",
+                    !bt709Compat ? " / BT.2020 matrix" : "");
             } else {
                 int hwErr = av_hwdevice_ctx_create(&p->hwDeviceCtx,
                     AV_HWDEVICE_TYPE_CUDA, nullptr, nullptr, 0);
@@ -386,10 +389,10 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
                     if (framesRef) {
                         auto* fc = reinterpret_cast<AVHWFramesContext*>(framesRef->data);
                         fc->format = AV_PIX_FMT_CUDA;
-                        // Phase B writes NV12 directly from the kernel — request
-                        // an NV12 hwframe instead of YUV420P so libavcodec
-                        // doesn't insert an extra format-conversion step.
-                        fc->sw_format = AV_PIX_FMT_NV12;
+                        // The kernel writes NV12 (8-bit) or P010 (10-bit)
+                        // directly, so request that hwframe sw_format and let
+                        // libavcodec skip its own format conversion.
+                        fc->sw_format = is10bit ? AV_PIX_FMT_P010LE : AV_PIX_FMT_NV12;
                         fc->width = s.width;
                         fc->height = s.height;
                         fc->initial_pool_size = 8;
@@ -400,9 +403,12 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
                             p->videoCtx->pix_fmt = AV_PIX_FMT_CUDA;
                             p->useCudaUpload = true;
                             p->useCudaDirectKernel = true;
+                            p->useCudaP010 = is10bit;
                             fprintf(stderr,
-                                "[MovEncoder] CUDA RGB->NV12 kernel "
-                                "(Phase B) enabled.\n");
+                                "[MovEncoder] CUDA RGB->%s kernel "
+                                "(Phase B%s) enabled.\n",
+                                is10bit ? "P010" : "NV12",
+                                is10bit ? "/E.1" : "");
                         } else {
                             av_buffer_unref(&framesRef);
                             char buf[128]{};
@@ -571,10 +577,10 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
     AVFrame* hwFrame = nullptr;
     if (p->useCudaDirectKernel) {
         // Phase B fast path. Skips sws_scale entirely: kernel takes the
-        // interleaved RGB float buffer and writes NV12 straight into the
-        // NVENC hwframe. The H->D copy of the RGB happens inside the
-        // kernel wrapper (one cudaMemcpyAsync), so we don't touch
-        // p->yuvFrame / p->rgbStaging / p->sws at all.
+        // interleaved RGB float buffer and writes NV12 (8-bit) or P010
+        // (10-bit) straight into the NVENC hwframe. The H->D copy of the
+        // RGB happens inside the kernel wrapper (one cudaMemcpyAsync), so we
+        // don't touch p->yuvFrame / p->rgbStaging / p->sws at all.
         hwFrame = av_frame_alloc();
         if (!hwFrame) Throw("av_frame_alloc(hw) failed");
         int hwErr = av_hwframe_get_buffer(p->hwFramesCtx, hwFrame, 0);
@@ -582,14 +588,17 @@ void MovEncoder::WriteVideoFrame(const float* rgb) {
             av_frame_free(&hwFrame);
             ThrowAv("av_hwframe_get_buffer", hwErr);
         }
-        const bool ok = motioncam::cuda::RgbFloatToNv12(
-            rgb,
-            hwFrame->data[0], hwFrame->data[1],
-            w, h,
-            hwFrame->linesize[0], hwFrame->linesize[1]);
+        const bool ok = p->useCudaP010
+            ? motioncam::cuda::RgbFloatToP010(
+                rgb, hwFrame->data[0], hwFrame->data[1],
+                w, h, hwFrame->linesize[0], hwFrame->linesize[1])
+            : motioncam::cuda::RgbFloatToNv12(
+                rgb, hwFrame->data[0], hwFrame->data[1],
+                w, h, hwFrame->linesize[0], hwFrame->linesize[1]);
         if (!ok) {
             av_frame_free(&hwFrame);
-            Throw("RgbFloatToNv12 kernel failed");
+            Throw(p->useCudaP010 ? "RgbFloatToP010 kernel failed"
+                                 : "RgbFloatToNv12 kernel failed");
         }
         frameToSend = hwFrame;
         goto send_frame;
@@ -1082,14 +1091,21 @@ void MovEncoder::WriteVideoFrameFromBayer(
     }
 
     // Full chain on GPU: bayer -> normalise -> LSM -> debayer -> matrix
-    // + curve -> NV12. Writes directly into the hwframe's Y/UV planes.
-    const bool ok = motioncam::cuda::ProcessBayerToNv12(
-        bayer, wb, C,
-        hwFrame->data[0], hwFrame->data[1],
-        hwFrame->linesize[0], hwFrame->linesize[1]);
+    // + curve (+ optional 3D LUT) -> NV12 (8-bit) or P010 (10-bit). Writes
+    // directly into the hwframe's Y/UV planes.
+    const bool ok = p->useCudaP010
+        ? motioncam::cuda::ProcessBayerToP010(
+            bayer, wb, C,
+            hwFrame->data[0], hwFrame->data[1],
+            hwFrame->linesize[0], hwFrame->linesize[1])
+        : motioncam::cuda::ProcessBayerToNv12(
+            bayer, wb, C,
+            hwFrame->data[0], hwFrame->data[1],
+            hwFrame->linesize[0], hwFrame->linesize[1]);
     if (!ok) {
         av_frame_free(&hwFrame);
-        Throw("ProcessBayerToNv12 kernel failed");
+        Throw(p->useCudaP010 ? "ProcessBayerToP010 kernel failed"
+                             : "ProcessBayerToNv12 kernel failed");
     }
 
     hwFrame->pts = p->videoPts++;

@@ -477,32 +477,22 @@ bool MaybeApplyLut3D(const BayerPipelineConstants& C, int W, int H,
 }
 }  // namespace
 
-bool ProcessBayerToRgb(
-    const uint16_t* bayer_host,
-    const float wb[3],
-    const BayerPipelineConstants& C,
-    float* rgb_host_out)
-{
-    if (!IsCudaAvailable()) return false;
-    if (!bayer_host || !rgb_host_out || !wb) return false;
-    if (C.width <= 0 || C.height <= 0) return false;
-
-    const int W = C.width;
-    const int H = C.height;
+// Shared bayer->ACEScg/target chain: upload -> normalise -> (LSM) -> debayer
+// -> matrix(+curve) -> (3D LUT). Leaves the result in gRgbFloat. Caller must
+// hold gBufMutex. Does NOT synchronise — the tail step (host copy / NV12 /
+// P010) handles that. Returns false on any launch/copy error.
+namespace {
+bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
+                         const BayerPipelineConstants& C, int W, int H) {
     const size_t n = size_t(W) * size_t(H);
 
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (!EnsureBuffers(W, H)) return false;
-
-    // 1. Upload bayer u16
     cudaError_t err = cudaMemcpyAsync(
         gBayerU16, bayer_host, n * sizeof(uint16_t),
         cudaMemcpyHostToDevice, 0);
     if (err != cudaSuccess) return false;
 
-    // 2. Combine per-CFA-position normalisation constants. scale[i] folds
-    //    both the dynamic-range normalise and the WB multiply into one mul,
-    //    matching what Debayer.cpp::NormalizeBayer does on the CPU.
+    // Fold dynamic-range normalise + WB multiply into one scale per CFA
+    // position (matches Debayer.cpp::NormalizeBayer).
     float blacks[4];
     float scales[4];
     for (int i = 0; i < 4; ++i) {
@@ -515,71 +505,74 @@ bool ProcessBayerToRgb(
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
 
     NormalizeBayerKernel<<<grid, block>>>(
-        gBayerU16, gBayerFloat,
-        W, H,
+        gBayerU16, gBayerFloat, W, H,
         blacks[0], blacks[1], blacks[2], blacks[3],
         scales[0], scales[1], scales[2], scales[3]);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
+    if (cudaGetLastError() != cudaSuccess) return false;
 
-    // 2b. Optional Lens Shading Map. Uploaded each call - tiny (~3-15 KB)
-    //     so we don't bother caching unless profiling shows it matters.
+    // Optional lens shading map (uploaded each call - tiny).
     if (C.lsm_w >= 2 && C.lsm_h >= 2 && C.lsm_host) {
         const size_t lsmBytes = size_t(C.lsm_w) * size_t(C.lsm_h) * 4 * sizeof(float);
         if (C.lsm_w != gLsmW || C.lsm_h != gLsmH || gLsmDevice == nullptr) {
             if (gLsmDevice) { cudaFree(gLsmDevice); gLsmDevice = nullptr; }
-            err = cudaMalloc(reinterpret_cast<void**>(&gLsmDevice), lsmBytes);
-            if (err != cudaSuccess) return false;
+            if (cudaMalloc(reinterpret_cast<void**>(&gLsmDevice), lsmBytes) != cudaSuccess)
+                return false;
             gLsmW = C.lsm_w;
             gLsmH = C.lsm_h;
         }
-        err = cudaMemcpyAsync(gLsmDevice, C.lsm_host, lsmBytes,
-                              cudaMemcpyHostToDevice, 0);
-        if (err != cudaSuccess) return false;
+        if (cudaMemcpyAsync(gLsmDevice, C.lsm_host, lsmBytes,
+                            cudaMemcpyHostToDevice, 0) != cudaSuccess)
+            return false;
 
         ApplyLensShadingKernel<<<grid, block>>>(
             gBayerFloat, W, H,
             gLsmDevice, C.lsm_w, C.lsm_h,
             C.cfa_to_lsm[0], C.cfa_to_lsm[1],
             C.cfa_to_lsm[2], C.cfa_to_lsm[3]);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return false;
+        if (cudaGetLastError() != cudaSuccess) return false;
     }
 
-    // 3. Bilinear debayer.
     DebayerBilinearKernel<<<grid, block>>>(
-        gBayerFloat, gRgbFloat,
-        W, H,
+        gBayerFloat, gRgbFloat, W, H,
         C.cfa_channel[0], C.cfa_channel[1],
         C.cfa_channel[2], C.cfa_channel[3]);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
+    if (cudaGetLastError() != cudaSuccess) return false;
 
-    // 4. cam-RGB -> output-RGB in one matrix mul, plus optional curve.
     ApplyMatrixCurveKernel<<<grid, block>>>(
-        gRgbFloat,
-        W, H,
+        gRgbFloat, W, H,
         C.cam_to_output[0], C.cam_to_output[1], C.cam_to_output[2],
         C.cam_to_output[3], C.cam_to_output[4], C.cam_to_output[5],
         C.cam_to_output[6], C.cam_to_output[7], C.cam_to_output[8],
         C.curve);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
+    if (cudaGetLastError() != cudaSuccess) return false;
 
-    // 4b. Phase D: optional ACEScg->target 3D LUT (OCIO targets).
-    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
+    // Phase D: optional ACEScg->target 3D LUT (OCIO targets).
+    return MaybeApplyLut3D(C, W, H, grid, block);
+}
+}  // namespace
 
-    // 5. Copy result to host for verification (Phase C.1 only, used by
-    //    the Python correctness binding). Phase C.2's ProcessBayerToNv12
-    //    skips this step entirely.
-    err = cudaMemcpy(
-        rgb_host_out, gRgbFloat,
-        n * 3 * sizeof(float),
-        cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) return false;
+bool ProcessBayerToRgb(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    float* rgb_host_out)
+{
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !rgb_host_out || !wb) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
 
-    err = cudaDeviceSynchronize();
-    return err == cudaSuccess;
+    const int W = C.width, H = C.height;
+    const size_t n = size_t(W) * size_t(H);
+
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    if (!EnsureBuffers(W, H)) return false;
+    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+
+    // Copy the result to host for the Python correctness bindings.
+    if (cudaMemcpy(rgb_host_out, gRgbFloat, n * 3 * sizeof(float),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
 }
 
 bool ProcessBayerToNv12(
@@ -591,96 +584,45 @@ bool ProcessBayerToNv12(
     int   y_pitch_bytes,
     int   uv_pitch_bytes)
 {
-    // Phase C.2 fast path. Identical to ProcessBayerToRgb up through the
-    // matrix kernel, then chains the resident gRgbFloat into the Phase B
-    // NV12 converter (calling RgbFloatToNv12FromDevice with a device-side
-    // RGB pointer). Total H<->D transfers per frame: one bayer upload, one
-    // NV12 already-in-the-hwframe pointer. No RGB copy back to host.
-
+    // Phase C.2 fast path: run the shared chain, then hand the resident
+    // gRgbFloat to the Phase B NV12 converter. One bayer upload per frame,
+    // no RGB copy back to host. RgbFloatToNv12FromDevice does the final sync.
     if (!IsCudaAvailable()) return false;
     if (!bayer_host || !y_device || !uv_device || !wb) return false;
     if (C.width <= 0 || C.height <= 0) return false;
 
-    const int W = C.width;
-    const int H = C.height;
-    const size_t n = size_t(W) * size_t(H);
-
+    const int W = C.width, H = C.height;
     std::lock_guard<std::mutex> lock(gBufMutex);
     if (!EnsureBuffers(W, H)) return false;
+    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
 
-    cudaError_t err = cudaMemcpyAsync(
-        gBayerU16, bayer_host, n * sizeof(uint16_t),
-        cudaMemcpyHostToDevice, 0);
-    if (err != cudaSuccess) return false;
-
-    float blacks[4];
-    float scales[4];
-    for (int i = 0; i < 4; ++i) {
-        const float invWb_c = 1.0f / wb[C.cfa_channel[i]];
-        blacks[i] = float(C.black[i]);
-        scales[i] = C.inv_range[i] * invWb_c;
-    }
-
-    dim3 block(32, 8);
-    dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
-
-    NormalizeBayerKernel<<<grid, block>>>(
-        gBayerU16, gBayerFloat,
-        W, H,
-        blacks[0], blacks[1], blacks[2], blacks[3],
-        scales[0], scales[1], scales[2], scales[3]);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
-
-    if (C.lsm_w >= 2 && C.lsm_h >= 2 && C.lsm_host) {
-        const size_t lsmBytes = size_t(C.lsm_w) * size_t(C.lsm_h) * 4 * sizeof(float);
-        if (C.lsm_w != gLsmW || C.lsm_h != gLsmH || gLsmDevice == nullptr) {
-            if (gLsmDevice) { cudaFree(gLsmDevice); gLsmDevice = nullptr; }
-            err = cudaMalloc(reinterpret_cast<void**>(&gLsmDevice), lsmBytes);
-            if (err != cudaSuccess) return false;
-            gLsmW = C.lsm_w;
-            gLsmH = C.lsm_h;
-        }
-        err = cudaMemcpyAsync(gLsmDevice, C.lsm_host, lsmBytes,
-                              cudaMemcpyHostToDevice, 0);
-        if (err != cudaSuccess) return false;
-
-        ApplyLensShadingKernel<<<grid, block>>>(
-            gBayerFloat, W, H,
-            gLsmDevice, C.lsm_w, C.lsm_h,
-            C.cfa_to_lsm[0], C.cfa_to_lsm[1],
-            C.cfa_to_lsm[2], C.cfa_to_lsm[3]);
-        err = cudaGetLastError();
-        if (err != cudaSuccess) return false;
-    }
-
-    DebayerBilinearKernel<<<grid, block>>>(
-        gBayerFloat, gRgbFloat,
-        W, H,
-        C.cfa_channel[0], C.cfa_channel[1],
-        C.cfa_channel[2], C.cfa_channel[3]);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
-
-    ApplyMatrixCurveKernel<<<grid, block>>>(
-        gRgbFloat,
-        W, H,
-        C.cam_to_output[0], C.cam_to_output[1], C.cam_to_output[2],
-        C.cam_to_output[3], C.cam_to_output[4], C.cam_to_output[5],
-        C.cam_to_output[6], C.cam_to_output[7], C.cam_to_output[8],
-        C.curve);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) return false;
-
-    // Phase D: optional ACEScg->target 3D LUT (OCIO targets) before NV12.
-    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
-
-    // Chain straight into the Phase B NV12 converter. RgbFloatToNv12FromDevice
-    // launches its own kernel + cudaDeviceSynchronize, so we don't need
-    // another sync here.
     return RgbFloatToNv12FromDevice(
-        gRgbFloat, y_device, uv_device,
-        W, H,
+        gRgbFloat, y_device, uv_device, W, H,
+        y_pitch_bytes, uv_pitch_bytes);
+}
+
+bool ProcessBayerToP010(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    void* y_device,
+    void* uv_device,
+    int   y_pitch_bytes,
+    int   uv_pitch_bytes)
+{
+    // Phase E.1: same as ProcessBayerToNv12 but feeds the 10-bit P010
+    // converter for Main10 NVENC output.
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !y_device || !uv_device || !wb) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
+
+    const int W = C.width, H = C.height;
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    if (!EnsureBuffers(W, H)) return false;
+    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+
+    return RgbFloatToP010FromDevice(
+        gRgbFloat, y_device, uv_device, W, H,
         y_pitch_bytes, uv_pitch_bytes);
 }
 
