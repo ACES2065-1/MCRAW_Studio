@@ -60,6 +60,15 @@ except Exception as exc:  # pragma: no cover
 
 from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 
+# The real-time player lives in its own module. Import AFTER mcraw — player.py
+# imports mcraw directly and relies on _setup_paths() having already run.
+from player import (  # noqa: E402
+    AudioPlayer,
+    FullscreenPreview,
+    PlaybackWorker,
+    transport_icon,
+)
+
 
 def _safe_error(exc: BaseException) -> str:
     """Format an exception for the log without leaking source structure.
@@ -558,6 +567,112 @@ class DropList(QtWidgets.QListWidget):
             event.acceptProposedAction()
 
 
+# ----- Preferences ------------------------------------------------------------
+
+def _system_ram_bytes() -> int:
+    """Total physical RAM in bytes (Windows GlobalMemoryStatusEx), or 0 if it
+    can't be determined. Used to cap the preview-cache budget at a fraction of
+    RAM so the user can't starve the OS."""
+    try:
+        import ctypes
+
+        class _MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullTotalPhys)
+    except Exception:
+        pass
+    return 0
+
+
+class _PreferencesDialog(QtWidgets.QDialog):
+    """App-wide preferences — the set-once-and-forget options kept out of the
+    main window so it stays uncluttered. Organised into group boxes so new
+    rarely-touched settings slot in without crowding anything. Opened from the
+    Settings menu; persisted to config.json by the owner."""
+
+    def __init__(self, owner: QtWidgets.QWidget, prefs: dict) -> None:
+        super().__init__(owner)
+        self.setWindowTitle("Preferences")
+        self.setModal(True)
+        self.setMinimumWidth(440)
+        self._ram = _system_ram_bytes()
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        # ---- Memory & Cache -------------------------------------------------
+        grp = QtWidgets.QGroupBox("Memory && Cache")
+        form = QtWidgets.QFormLayout(grp)
+
+        self.cacheEnable = QtWidgets.QCheckBox("Enable live preview cache")
+        self.cacheEnable.setChecked(bool(prefs.get("preview_cache_enabled", True)))
+        self.cacheEnable.setToolTip(
+            "Keep decoded preview frames in RAM so replays and loops play back at\n"
+            "full rate. The first play fills the cache; later passes read from it.")
+        form.addRow(self.cacheEnable)
+
+        # Cap the ceiling at 75% of physical RAM (leave headroom for the OS and
+        # the decode/encode working set). Fall back to 8 GB if RAM is unknown.
+        self._max_gb = 8.0
+        if self._ram > 0:
+            self._max_gb = max(1.0, round(self._ram * 0.75 / (1024 ** 3), 2))
+        self.cacheSize = QtWidgets.QDoubleSpinBox()
+        self.cacheSize.setDecimals(2)
+        self.cacheSize.setSingleStep(0.25)
+        self.cacheSize.setSuffix(" GB")
+        self.cacheSize.setRange(0.25, self._max_gb)
+        self.cacheSize.setValue(min(self._max_gb,
+                                    float(prefs.get("preview_cache_gb", 1.2))))
+        self.cacheSize.setToolTip(
+            "Maximum RAM the preview cache may use. When it fills, the oldest\n"
+            "frames are dropped first (least-recently-used).")
+        form.addRow("Maximum cache size:", self.cacheSize)
+
+        if self._ram > 0:
+            hint = QtWidgets.QLabel(
+                f"System RAM: {self._ram / (1024 ** 3):.1f} GB   ·   "
+                f"capped at {self._max_gb:.1f} GB to leave headroom for the OS "
+                f"and decoding.")
+        else:
+            hint = QtWidgets.QLabel(
+                "System RAM unknown — choose a value your machine can spare.")
+        hint.setStyleSheet("color:#9a9a9a;")
+        hint.setWordWrap(True)
+        form.addRow(hint)
+
+        self.cacheEnable.toggled.connect(self.cacheSize.setEnabled)
+        self.cacheSize.setEnabled(self.cacheEnable.isChecked())
+
+        root.addWidget(grp)
+        root.addStretch(1)
+
+        btns = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def values(self) -> dict:
+        """The chosen preference values, merged over the existing dict by caller."""
+        return {
+            "preview_cache_enabled": bool(self.cacheEnable.isChecked()),
+            "preview_cache_gb": float(self.cacheSize.value()),
+        }
+
+
 # ----- Main window -----------------------------------------------------------
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -566,6 +681,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("MCRAW Studio")
         self.resize(1200, 760)
         self.setAcceptDrops(True)
+
+        # App-wide preferences (auto-loaded; separate from the user-saved render
+        # presets). Drives the preview-cache budget below and grows over time.
+        self._prefs: dict = self._load_config()
 
         self._thread: QtCore.QThread | None = None
         self._worker: RenderWorker | None = None
@@ -586,6 +705,44 @@ class MainWindow(QtWidgets.QMainWindow):
         # Background thumbnail decoder.
         self._thumb = ThumbWorker()
         self._thumb.done.connect(self._on_thumb_done)
+
+        # Real-time playback engine + transport state.
+        self._player = PlaybackWorker()
+        self._player.frame.connect(self._on_play_frame)
+        self._player.finished.connect(self._on_play_finished)
+        self._fs_window = None
+        self._muted = False
+        self._volume = 0.8
+        self._playback_realtime = True
+        # Push the persisted cache budget / enable into the worker's cache.
+        self._apply_cache_prefs()
+
+        # Preview audio (best-effort, auto-muted when playback isn't real-time).
+        self._audio = AudioPlayer()
+        self._audio.set_volume(self._volume)
+        self._audio_cache: dict[str, tuple] = {}   # path -> (pcm, rate, channels, ts)
+        self._audio_slice = b""                    # PCM for the current in/out range
+        self._audio_rate = 0
+        self._audio_channels = 0
+        self._audio_ts: list = []
+        self._play_start = 0
+        # Hysteresis for the audio auto-mute so frame-time jitter doesn't stutter
+        # the sink: start after a short real-time run, stop after a longer slow run.
+        self._rt_run = 0
+        self._slow_run = 0
+        self._audio_should_play = False
+
+        # Player keyboard shortcuts (window-scoped). Buttons use NoFocus so
+        # Space reaches these instead of toggling a focused button.
+        for keys, slot in (
+            (QtGui.QKeySequence(QtCore.Qt.Key_Space), self._toggle_play),
+            (QtGui.QKeySequence(QtCore.Qt.Key_F),     self._toggle_fullscreen),
+            (QtGui.QKeySequence(QtCore.Qt.Key_I),     self._mark_in),
+            (QtGui.QKeySequence(QtCore.Qt.Key_O),     self._mark_out),
+        ):
+            sc = QtGui.QShortcut(keys, self)
+            sc.setContext(QtCore.Qt.WindowShortcut)
+            sc.activated.connect(slot)
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -616,36 +773,82 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scrubSlider.valueChanged.connect(self._on_scrub_changed)
         pv.addWidget(self.scrubSlider)
 
+        # ----- Transport bar (player controls) -------------------------------
+        # Cached icons (play/pause + volume swap on state changes).
+        self._icon_play = transport_icon("play")
+        self._icon_pause = transport_icon("pause")
+        self._icon_vol_on = transport_icon("vol_on")
+        self._icon_vol_off = transport_icon("vol_off")
+
+        def _tbtn(kind: str, tip: str, slot) -> QtWidgets.QPushButton:
+            b = QtWidgets.QPushButton()
+            b.setIcon(transport_icon(kind))
+            b.setIconSize(QtCore.QSize(18, 18))
+            b.setToolTip(tip)
+            b.setFixedSize(34, 28)
+            b.setFlat(True)
+            b.setEnabled(False)
+            b.setFocusPolicy(QtCore.Qt.NoFocus)  # so Space/keys hit shortcuts, not buttons
+            b.clicked.connect(slot)
+            return b
+
+        transport = QtWidgets.QHBoxLayout()
+        transport.setSpacing(4)
+        self.markInBtn = _tbtn("mark_in", "Set In point at the playhead (I)", self._mark_in)
+        self.goStartBtn = _tbtn("skip_start", "Jump to In point", self._go_to_in)
+        self.playBtn = _tbtn("play", "Play / Pause (Space)", self._toggle_play)
+        self.goEndBtn = _tbtn("skip_end", "Jump to Out point", self._go_to_out)
+        self.markOutBtn = _tbtn("mark_out", "Set Out point at the playhead (O)", self._mark_out)
+        self.resetRangeBtn = _tbtn("reset", "Reset In/Out to the whole clip", self._reset_range)
+        for b in (self.markInBtn, self.goStartBtn, self.playBtn,
+                  self.goEndBtn, self.markOutBtn):
+            transport.addWidget(b)
+        transport.addSpacing(10)
+        transport.addWidget(self.resetRangeBtn)
+
         self.frameLabel = QtWidgets.QLabel("Frame —")
         self.frameLabel.setObjectName("frameLabel")
-        self.frameLabel.setAlignment(QtCore.Qt.AlignCenter)
-        pv.addWidget(self.frameLabel)
+        transport.addSpacing(12)
+        transport.addWidget(self.frameLabel)
+        transport.addStretch(1)
 
-        rangeRow = QtWidgets.QHBoxLayout()
-        rangeRow.addWidget(QtWidgets.QLabel("In:"))
-        self.inSpin = QtWidgets.QSpinBox()
-        self.inSpin.setRange(0, 0)
-        self.inSpin.setEnabled(False)
-        self.inSpin.valueChanged.connect(self._on_in_edited)
-        rangeRow.addWidget(self.inSpin)
-        markInBtn = QtWidgets.QPushButton("Mark In")
-        markInBtn.clicked.connect(self._mark_in)
-        rangeRow.addWidget(markInBtn)
-        rangeRow.addSpacing(16)
-        rangeRow.addWidget(QtWidgets.QLabel("Out:"))
-        self.outSpin = QtWidgets.QSpinBox()
-        self.outSpin.setRange(0, 0)
-        self.outSpin.setEnabled(False)
-        self.outSpin.valueChanged.connect(self._on_out_edited)
-        rangeRow.addWidget(self.outSpin)
-        markOutBtn = QtWidgets.QPushButton("Mark Out")
-        markOutBtn.clicked.connect(self._mark_out)
-        rangeRow.addWidget(markOutBtn)
-        rangeRow.addStretch(1)
-        resetBtn = QtWidgets.QPushButton("Reset Range")
-        resetBtn.clicked.connect(self._reset_range)
-        rangeRow.addWidget(resetBtn)
-        pv.addLayout(rangeRow)
+        # Live preview rate / proxy indicator (set during playback).
+        self.playRateLabel = QtWidgets.QLabel("")
+        self.playRateLabel.setObjectName("playRateLabel")
+        transport.addWidget(self.playRateLabel)
+        transport.addSpacing(10)
+
+        # Preview quality / proxy: decode at 1/N resolution so weak machines can
+        # keep playback near real-time (handy for spotting dropped frames in the
+        # source). Pure preview — never affects renders.
+        transport.addWidget(QtWidgets.QLabel("Quality:"))
+        self.previewQualityCombo = QtWidgets.QComboBox()
+        self.previewQualityCombo.setToolTip(
+            "Preview decode resolution. Lower = faster playback on slow machines\n"
+            "(decodes at 1/N, then scales to fit the preview). Does not affect renders.")
+        for _qlabel, _qbin in (("Full", 1), ("1/2", 2), ("1/3", 3), ("1/4", 4)):
+            self.previewQualityCombo.addItem(_qlabel, _qbin)
+        _qi = self.previewQualityCombo.findData(int(self._prefs.get("preview_quality_bin", 1)))
+        self.previewQualityCombo.setCurrentIndex(_qi if _qi >= 0 else 0)
+        self.previewQualityCombo.currentIndexChanged.connect(self._on_preview_quality_changed)
+        transport.addWidget(self.previewQualityCombo)
+        transport.addSpacing(10)
+
+        self.muteBtn = _tbtn("vol_on", "Mute / unmute preview audio", self._toggle_mute)
+        self.muteBtn.setEnabled(True)
+        transport.addWidget(self.muteBtn)
+        self.volumeSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.volumeSlider.setRange(0, 100)
+        self.volumeSlider.setValue(80)
+        self.volumeSlider.setFixedWidth(90)
+        self.volumeSlider.setToolTip("Preview volume")
+        self.volumeSlider.valueChanged.connect(self._on_volume_changed)
+        transport.addWidget(self.volumeSlider)
+        transport.addSpacing(8)
+        self.fullscreenBtn = _tbtn("fullscreen", "Fullscreen preview (F / Esc to exit)",
+                                   self._toggle_fullscreen)
+        transport.addWidget(self.fullscreenBtn)
+        pv.addLayout(transport)
 
         topSplit.addWidget(previewBox)
         topSplit.setStretchFactor(0, 1)
@@ -1015,6 +1218,14 @@ class MainWindow(QtWidgets.QMainWindow):
         viewLogAction.triggered.connect(self._open_log_file)
         openLogDirAction = helpMenu.addAction("Open log &folder…")
         openLogDirAction.triggered.connect(self._open_log_folder)
+
+        # Settings — home for the set-once-and-forget options (memory/cache and,
+        # over time, other rarely-touched preferences) so the main window stays
+        # uncluttered. Mirrors After Effects' Edit > Preferences pattern.
+        settingsMenu = bar.addMenu("&Settings")
+        prefsAction = settingsMenu.addAction("&Preferences…")
+        prefsAction.setToolTip("Memory & cache and other app options.")
+        prefsAction.triggered.connect(self._open_preferences)
 
         # Top-level entries — visible directly in the menu bar without a submenu.
         # These are intentionally surfaced because Donate / Report-a-problem are
@@ -1436,6 +1647,54 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage(f"Loaded preset: {Path(fname).name}", 5000)
         log.info("Preset loaded: %s", fname)
 
+    # ----- App preferences (auto-persisted config.json) -----
+    def _config_path(self) -> Path:
+        """Location of the auto-loaded app config. Sits beside the presets
+        folder under ~/Documents/MCRAWStudio; falls back to the home dir."""
+        d = Path(os.path.expanduser("~/Documents/MCRAWStudio"))
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            d = Path(os.path.expanduser("~"))
+        return d / "config.json"
+
+    def _load_config(self) -> dict:
+        """Read config.json at startup. Missing / unreadable -> empty dict (the
+        callers all default each key), so a first run or a corrupt file is fine."""
+        import json
+        try:
+            with open(self._config_path(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            pass
+        return {}
+
+    def _save_config(self) -> None:
+        import json
+        try:
+            with open(self._config_path(), "w", encoding="utf-8") as f:
+                json.dump(self._prefs, f, indent=2)
+        except Exception as exc:
+            log.warning("Could not save config: %s", exc)
+
+    def _apply_cache_prefs(self) -> None:
+        """Push the persisted preview-cache settings into the playback worker."""
+        enabled = bool(self._prefs.get("preview_cache_enabled", True))
+        gb = float(self._prefs.get("preview_cache_gb", 1.2))
+        self._player.set_cache_enabled(enabled)
+        self._player.set_cache_budget(int(gb * (1024 ** 3)))
+
+    @QtCore.Slot()
+    def _open_preferences(self) -> None:
+        dlg = _PreferencesDialog(self, self._prefs)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self._prefs.update(dlg.values())
+            self._apply_cache_prefs()
+            self._save_config()
+            self.statusBar().showMessage("Preferences saved.", 4000)
+
     # ----- Preview pane (selection / scrub / mark in/out) -----
     def _current_path(self) -> str | None:
         items = self.dropList.selectedItems()
@@ -1445,10 +1704,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _on_vignette_toggled(self, _checked: bool = False) -> None:
         # The cached preview was decoded with the previous vignette setting —
-        # invalidate every clip's thumb so the current one re-decodes.
+        # invalidate every clip's thumb so the current one re-decodes, and drop
+        # the live playback cache (next play re-fills it with the new setting).
         for st in self._file_state.values():
             st["thumb_img"] = None
             st["thumb_frame"] = None
+        self._player.clear_cache()
         self._refresh_preview_for_current()
 
     def _refresh_preview_for_current(self) -> None:
@@ -1459,8 +1720,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.previewLabel.setPixmap(QtGui.QPixmap())
             self.scrubSlider.setEnabled(False)
             self.scrubSlider.setRange(0, 0)
-            self.inSpin.setEnabled(False); self.inSpin.setRange(0, 0)
-            self.outSpin.setEnabled(False); self.outSpin.setRange(0, 0)
+            self._set_transport_enabled(False)
             self.frameLabel.setText("Frame —")
             return
 
@@ -1471,24 +1731,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scrubSlider.setValue(min(st["scrub"], total - 1))
         self.scrubSlider.blockSignals(False)
         self.scrubSlider.setEnabled(total > 1)
+        self._set_transport_enabled(total > 0)
 
-        # Update in/out spin
-        self.inSpin.blockSignals(True)
-        self.inSpin.setRange(0, max(0, total - 1))
-        self.inSpin.setValue(st["start"])
-        self.inSpin.blockSignals(False)
-        self.inSpin.setEnabled(True)
-
-        self.outSpin.blockSignals(True)
-        self.outSpin.setRange(1, total)
-        self.outSpin.setValue(st["end"])
-        self.outSpin.blockSignals(False)
-        self.outSpin.setEnabled(True)
-
-        # Frame label
+        # Frame label: playhead position + In/Out range.
         self.frameLabel.setText(
             f"Frame {st['scrub'] + 1} / {total}    "
-            f"(render: {st['start']} → {st['end']})"
+            f"(In {st['start']}  ·  Out {st['end']})"
         )
 
         # Show cached thumb if it matches; otherwise kick a decode
@@ -1507,9 +1755,14 @@ class MainWindow(QtWidgets.QMainWindow):
             QtCore.Qt.KeepAspectRatio,
             QtCore.Qt.SmoothTransformation,
         ))
+        if getattr(self, "_fs_window", None) is not None:
+            self._fs_window.set_image(pixmap)
 
     @QtCore.Slot()
     def _on_selection_changed(self) -> None:
+        # Stop playback when moving to a different clip (worker is per-path).
+        if self._player.is_playing():
+            self._stop_playback()
         self._refresh_preview_for_current()
 
     @QtCore.Slot(int)
@@ -1521,9 +1774,11 @@ class MainWindow(QtWidgets.QMainWindow):
         st["scrub"] = value
         self.frameLabel.setText(
             f"Frame {value + 1} / {st['total']}    "
-            f"(render: {st['start']} → {st['end']})"
+            f"(In {st['start']}  ·  Out {st['end']})"
         )
-        self._scrubTimer.start()
+        # While playing, the worker drives frames — don't also kick a thumb decode.
+        if not self._player.is_playing():
+            self._scrubTimer.start()
 
     @QtCore.Slot()
     def _kick_thumb_decode(self) -> None:
@@ -1570,35 +1825,224 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sync_item_text(path)
         self._refresh_preview_for_current()
 
-    @QtCore.Slot(int)
-    def _on_in_edited(self, value: int) -> None:
+    # ----- Transport: in/out jumps, play/pause, volume, fullscreen --------
+    def _set_transport_enabled(self, on: bool) -> None:
+        for b in (self.markInBtn, self.goStartBtn, self.playBtn,
+                  self.goEndBtn, self.markOutBtn, self.resetRangeBtn,
+                  self.fullscreenBtn):
+            b.setEnabled(on)
+
+    @QtCore.Slot()
+    def _go_to_in(self) -> None:
+        st = self._file_state.get(self._current_path() or "")
+        if st:
+            self.scrubSlider.setValue(int(st["start"]))
+
+    @QtCore.Slot()
+    def _go_to_out(self) -> None:
+        st = self._file_state.get(self._current_path() or "")
+        if st:
+            self.scrubSlider.setValue(max(0, int(st["end"]) - 1))
+
+    @QtCore.Slot()
+    def _toggle_play(self) -> None:
+        if self._player.is_playing():
+            self._stop_playback()
+            return
         path = self._current_path()
         st = self._file_state.get(path) if path else None
-        if not st:
+        if not st or st["total"] < 2:
             return
-        st["start"] = max(0, min(value, st["total"] - 1))
-        if st["end"] <= st["start"]:
-            st["end"] = min(st["total"], st["start"] + 1)
-        self._sync_item_text(path)
-        self.frameLabel.setText(
-            f"Frame {st['scrub'] + 1} / {st['total']}    "
-            f"(render: {st['start']} → {st['end']})"
-        )
+        # GPU when available (real-time at full preview size); CPU otherwise,
+        # at a smaller proxy size so it has a chance of keeping up.
+        gpu = bool(mcraw.cuda_available())
+        max_dim = 1280 if gpu else 768
+        in_idx = int(st["start"])           # In point — the loop-back target
+        end = int(st["end"])                # Out point
+        start = int(st["scrub"])            # begin from the playhead…
+        if not (in_idx <= start < end - 1):
+            start = in_idx                  # …unless it's outside the range / at the end
+        preview_bin = int(self.previewQualityCombo.currentData() or 1)
+        # Prepare the preview audio over the whole loop range [In, Out). It's
+        # started later in _on_play_frame, but only while playback is real-time.
+        self._prepare_audio(path, in_idx, end)
+        self.playBtn.setIcon(self._icon_pause)
+        self._player.play(path, start, end, float(st["fps"]) or 30.0,
+                          max_dim, self.vignetteCheck.isChecked(), gpu,
+                          preview_bin=preview_bin, loop_start=in_idx, loop=True)
+
+    def _stop_playback(self) -> None:
+        self._player.stop()
+        self._audio.stop()
+        self.playBtn.setIcon(self._icon_play)
+        self.playRateLabel.setText("")
+
+    @QtCore.Slot()
+    def _on_preview_quality_changed(self) -> None:
+        # Remember the choice (low-end users want it to stick) and drop the cache
+        # since its frames are at the previous resolution. If we're mid-playback,
+        # restart so the new quality takes effect right away.
+        self._prefs["preview_quality_bin"] = int(self.previewQualityCombo.currentData() or 1)
+        self._save_config()
+        self._player.clear_cache()
+        if self._player.is_playing():
+            self._stop_playback()
+            self._toggle_play()
+
+    @QtCore.Slot(str, int, QtGui.QImage, float, float, bool)
+    def _on_play_frame(self, path: str, idx: int, img: QtGui.QImage,
+                       achieved: float, target: float, from_cache: bool) -> None:
+        if self._current_path() != path:
+            self._audio.stop()   # worker still on the old clip — silence it
+            return
+        st = self._file_state.get(path)
+        if st is not None:
+            st["scrub"] = idx
+        self._set_preview_pixmap(QtGui.QPixmap.fromImage(img))
+        self.scrubSlider.blockSignals(True)
+        self.scrubSlider.setValue(idx)
+        self.scrubSlider.blockSignals(False)
+        total = st["total"] if st else idx + 1
+        self.frameLabel.setText(f"Frame {idx + 1} / {total}")
+        # Real-time vs proxy indicator + audio auto-mute (Stage 3 wires audio).
+        # A cache hit is delivered instantly, so it always counts as real-time;
+        # a miss below target means we're still filling the cache this pass.
+        realtime = from_cache or achieved >= target * 0.9
+        self._playback_realtime = realtime
+        if realtime:
+            label = f"{min(achieved, target):.0f} fps"
+            if from_cache:
+                label += " · cached"
+        elif not from_cache:
+            label = f"{achieved:.0f} fps · caching"
+        else:
+            label = f"{achieved:.0f} fps · slow"
+        self.playRateLabel.setText(label)
+
+        # Audio: audible only when playback is *sustained* real-time. Hysteresis
+        # (start after a short real-time run, stop after a longer slow run) keeps
+        # frame-time jitter from stuttering the sink. Auto-muted on slow / caching
+        # passes; starts aligned to the current frame so it's in sync wherever it
+        # kicks in.
+        if realtime:
+            self._rt_run += 1
+            self._slow_run = 0
+        else:
+            self._slow_run += 1
+            self._rt_run = 0
+        if self._rt_run >= 5:
+            self._audio_should_play = True
+        elif self._slow_run >= 12:
+            self._audio_should_play = False
+        if self._audio.available() and self._audio_slice:
+            audible = self._audio_should_play and not self._muted and self._volume > 0.0
+            if audible and not self._audio.is_playing():
+                self._audio.start(self._audio_slice, self._audio_offset_for(idx))
+            elif not audible and self._audio.is_playing():
+                self._audio.stop()
+
+    @QtCore.Slot(str)
+    def _on_play_finished(self, path: str) -> None:
+        self._audio.stop()
+        self.playBtn.setIcon(self._icon_play)
+
+    @QtCore.Slot()
+    def _toggle_mute(self) -> None:
+        self._muted = not getattr(self, "_muted", False)
+        self.muteBtn.setIcon(self._icon_vol_off if self._muted else self._icon_vol_on)
+        self._audio.set_muted(self._muted)
 
     @QtCore.Slot(int)
-    def _on_out_edited(self, value: int) -> None:
-        path = self._current_path()
-        st = self._file_state.get(path) if path else None
-        if not st:
+    def _on_volume_changed(self, value: int) -> None:
+        self._volume = value / 100.0
+        self._audio.set_volume(self._volume)
+
+    # ----- Preview audio helpers -----
+    def _ensure_audio_loaded(self, path: str) -> tuple:
+        """Load + cache a clip's PCM (numpy-free), sample rate, channels and frame
+        timestamps. Returns (pcm, rate, channels, ts); empties on failure or a
+        silent clip. Cached per clip so we only decode the audio once."""
+        cached = self._audio_cache.get(path)
+        if cached is not None:
+            return cached
+        result = (b"", 0, 0, [])
+        if self._audio.available():
+            try:
+                d = mcraw.Decoder(path)
+                rate = int(d.audio_sample_rate)
+                ch = int(d.audio_channels)
+                pcm = d.load_audio_bytes() if (rate > 0 and ch > 0) else b""
+                result = (pcm, rate, ch, list(d.frames))
+            except Exception as exc:
+                print(f"[audio] load failed {Path(path).name}: {exc}")
+        self._audio_cache[path] = result
+        return result
+
+    def _prepare_audio(self, path: str, start: int, end: int) -> None:
+        """Build the PCM slice for the [start, end) frame range and configure the
+        sink. Audio starts at frame 0, so slice by timestamp (matches the render
+        path). Stores slice + context for _on_play_frame / _audio_offset_for."""
+        self._audio_slice = b""
+        self._audio_rate = 0
+        self._audio_channels = 0
+        self._audio_ts = []
+        self._play_start = start
+        self._rt_run = 0
+        self._slow_run = 0
+        self._audio_should_play = False
+        if not self._audio.available():
             return
-        st["end"] = max(1, min(value, st["total"]))
-        if st["start"] >= st["end"]:
-            st["start"] = max(0, st["end"] - 1)
-        self._sync_item_text(path)
-        self.frameLabel.setText(
-            f"Frame {st['scrub'] + 1} / {st['total']}    "
-            f"(render: {st['start']} → {st['end']})"
-        )
+        pcm, rate, ch, ts = self._ensure_audio_loaded(path)
+        if not pcm or rate <= 0 or ch <= 0 or not ts:
+            return
+        if not self._audio.configure(rate, ch):
+            return
+        n = len(ts)
+        s = max(0, min(start, n - 1))
+        e = max(s + 1, min(end, n))
+        bps = ch * 2                       # bytes per interleaved sample-frame
+        skip = int((ts[s] - ts[0]) / 1e9 * rate) * bps
+        keep = int((ts[e - 1] - ts[s]) / 1e9 * rate) * bps
+        if skip >= len(pcm):
+            return
+        self._audio_slice = pcm[skip:skip + keep] if keep > 0 else pcm[skip:]
+        self._audio_rate = rate
+        self._audio_channels = ch
+        self._audio_ts = ts
+        self._play_start = s
+
+    def _audio_offset_for(self, idx: int) -> int:
+        """Byte offset into the current slice for video frame `idx`, so audio can
+        (re)start in sync with the playhead wherever it kicks in."""
+        sl = self._audio_slice
+        ts = self._audio_ts
+        if not sl or self._audio_rate <= 0 or self._audio_channels <= 0 or not ts:
+            return 0
+        i = max(0, min(idx, len(ts) - 1))
+        bps = self._audio_channels * 2
+        off = int((ts[i] - ts[self._play_start]) / 1e9 * self._audio_rate) * bps
+        return (off % len(sl)) if off > 0 else 0
+
+    @QtCore.Slot()
+    def _toggle_fullscreen(self) -> None:
+        # Pop the preview label out to a frameless fullscreen window; Esc/F/click
+        # returns it. Playback keeps running (same worker, same signal).
+        if getattr(self, "_fs_window", None) is not None:
+            self._exit_fullscreen()
+            return
+        fs = FullscreenPreview(self)
+        fs.showFullScreen()
+        self._fs_window = fs
+        # Re-show the current frame in the fullscreen surface.
+        st = self._file_state.get(self._current_path() or "")
+        if st and st.get("thumb_img") is not None:
+            fs.set_image(QtGui.QPixmap.fromImage(st["thumb_img"]))
+
+    def _exit_fullscreen(self) -> None:
+        fs = getattr(self, "_fs_window", None)
+        if fs is not None:
+            fs.close()
+            self._fs_window = None
 
     @QtCore.Slot()
     def _reset_range(self) -> None:
@@ -1998,6 +2442,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._worker.cancel()
             self._thread.quit()
             self._thread.wait(5000)
+        # Stop the preview player thread + audio + close any fullscreen surface.
+        if getattr(self, "_player", None) is not None:
+            self._player.stop()
+            self._player.clear_cache()
+        if getattr(self, "_audio", None) is not None:
+            self._audio.stop()
+        self._exit_fullscreen()
         event.accept()
 
 
