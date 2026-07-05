@@ -202,6 +202,43 @@ bool ProcessBayerToRgb8(
 // Number of uint32 slots scope_out must provide.
 constexpr int kScopeSlots = 3 * 256 + 2;
 
+// ---------- Phase H: zero-readback preview display (CUDA-GL interop) ----
+//
+// The player's fastest display path: the preview chain runs on the GPU and
+// the result NEVER crosses PCIe. The playback thread calls
+// ProcessBayerToRgbaDevice (below) which leaves clamped RGBA8 in a device
+// buffer owned by the preview context; the GUI thread — inside paintGL,
+// with its GL context current — calls BlitPreviewRgbaToGLTexture to copy
+// device->texture (a device-to-device transfer) and draws the quad.
+// Falls back to the ProcessBayerToRgb8 readback path on any failure.
+
+// Runs the preview bayer chain and publishes RGBA8 (alpha=255) into the
+// preview context's device display buffer. Same options as
+// ProcessBayerToRgb8, including the optional scope histogram readback
+// (scopes are tiny and still come back over the bus). out_w/out_h return
+// the frame dimensions. Returns false on any CUDA error.
+bool ProcessBayerToRgbaDevice(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    int* out_w,
+    int* out_h,
+    uint32_t* scope_out = nullptr);
+
+// GUI-thread half: copies the most recently published RGBA frame into the
+// given GL_TEXTURE_2D (must be RGBA8 and at least frame-sized; the owning
+// GL context MUST be current on the calling thread). Registration with
+// CUDA is cached per texture id. Returns false if no frame has been
+// published or on any CUDA/GL error; out_w/out_h return the frame size.
+bool BlitPreviewRgbaToGLTexture(unsigned int gl_texture, int* out_w, int* out_h);
+
+// Drop the cached CUDA registration for a texture that's being destroyed
+// (call before deleting the GL texture / FBO).
+void UnregisterPreviewGLTexture(unsigned int gl_texture);
+
+// Free all interop state (registrations + the device display buffer).
+void ReleaseGlInterop();
+
 // Phase C.2 entry point. Same bayer pipeline as ProcessBayerToRgb but
 // instead of copying the result to host, hands the GPU RGB straight to
 // the Phase B RGB->NV12 kernel and writes the result into the caller-

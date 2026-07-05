@@ -21,11 +21,22 @@
 
 #include <cuda_runtime.h>
 
+// Phase H: CUDA-GL interop for the zero-readback preview. Windows-only
+// (this project ships a Windows GUI); other platforms get stub fallbacks.
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <GL/gl.h>
+#include <cuda_gl_interop.h>
+#endif
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 
 namespace motioncam {
@@ -79,6 +90,14 @@ struct PipelineCtx {
     bool      usePinned        = false;
     // Scope histogram accumulator (kScopeSlots uint32, preview ctx only).
     uint32_t* scopeDev         = nullptr;
+    // Phase H display buffer: RGBA8 frame that stays on the device for the
+    // GL blit. Guarded by mtx like everything else; rgbaValid flips true
+    // once a frame has been published.
+    uint8_t*  rgbaDev          = nullptr;
+    size_t    rgbaBytes        = 0;
+    int       rgbaW            = 0;
+    int       rgbaH            = 0;
+    bool      rgbaValid        = false;
     // 0 = legacy default stream (render). The preview ctx lazily creates a
     // cudaStreamNonBlocking stream so it never implicitly syncs with the
     // render's default-stream work.
@@ -206,6 +225,9 @@ void ReleaseCtxLocked(PipelineCtx& ctx) {
     if (ctx.pinnedBayer) { cudaFreeHost(ctx.pinnedBayer); ctx.pinnedBayer = nullptr; ctx.pinnedBayerBytes = 0; }
     if (ctx.pinnedRgb8)  { cudaFreeHost(ctx.pinnedRgb8);  ctx.pinnedRgb8  = nullptr; ctx.pinnedRgb8Bytes = 0; }
     if (ctx.scopeDev)    { cudaFree(ctx.scopeDev);        ctx.scopeDev    = nullptr; }
+    if (ctx.rgbaDev)     { cudaFree(ctx.rgbaDev);         ctx.rgbaDev     = nullptr;
+                           ctx.rgbaBytes = 0; ctx.rgbaW = 0; ctx.rgbaH = 0;
+                           ctx.rgbaValid = false; }
     ReleaseDenoiseLocked(ctx);
     ctx.bufW = 0;
     ctx.bufH = 0;
@@ -1175,6 +1197,158 @@ bool ProcessBayerToRgb8(
     }
     return true;
 }
+
+// Phase H: clamp float RGB -> RGBA8 (alpha 255), pixel-indexed. Same
+// quantise as RgbFloatToU8Kernel so the GL path matches the readback path.
+__global__ void RgbFloatToRgba8Kernel(const float* __restrict__ rgb,
+                                      uchar4* __restrict__ out, int pixels) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= pixels) return;
+    float r = rgb[size_t(i) * 3 + 0];
+    float g = rgb[size_t(i) * 3 + 1];
+    float b = rgb[size_t(i) * 3 + 2];
+    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+    out[i] = make_uchar4(uint8_t(r * 255.0f + 0.5f),
+                         uint8_t(g * 255.0f + 0.5f),
+                         uint8_t(b * 255.0f + 0.5f), 255u);
+}
+
+bool ProcessBayerToRgbaDevice(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    int* out_w,
+    int* out_h,
+    uint32_t* scope_out)
+{
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !wb || !out_w || !out_h) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
+
+    const int W = C.width, H = C.height;
+    const size_t n = size_t(W) * size_t(H);
+    const size_t rgbaBytes = n * 4;
+
+    PipelineCtx& ctx = gPreviewCtx;
+    std::lock_guard<std::mutex> lock(ctx.mtx);
+    if (!EnsureBuffers(ctx, W, H)) return false;
+    EnsurePreviewTransport(ctx, n * sizeof(uint16_t), n * 3);
+    if (ctx.rgbaBytes != rgbaBytes || !ctx.rgbaDev) {
+        ctx.rgbaValid = false;
+        if (ctx.rgbaDev) { cudaFree(ctx.rgbaDev); ctx.rgbaDev = nullptr; }
+        if (cudaMalloc(reinterpret_cast<void**>(&ctx.rgbaDev), rgbaBytes)
+                != cudaSuccess) {
+            ctx.rgbaDev = nullptr; ctx.rgbaBytes = 0; return false;
+        }
+        ctx.rgbaBytes = rgbaBytes;
+    }
+    if (!RunBayerChainLocked(ctx, bayer_host, wb, C, W, H)) return false;
+
+    const int block = 256;
+    const int grid = (int(n) + block - 1) / block;
+    RgbFloatToRgba8Kernel<<<grid, block, 0, ctx.stream>>>(
+        ctx.rgbFloat, reinterpret_cast<uchar4*>(ctx.rgbaDev), int(n));
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    if (scope_out) {
+        const size_t scopeBytes = size_t(kScopeSlots) * sizeof(uint32_t);
+        if (!ctx.scopeDev &&
+            cudaMalloc(reinterpret_cast<void**>(&ctx.scopeDev), scopeBytes)
+                != cudaSuccess) {
+            ctx.scopeDev = nullptr;
+            return false;
+        }
+        if (cudaMemsetAsync(ctx.scopeDev, 0, scopeBytes, ctx.stream) != cudaSuccess)
+            return false;
+        const int hgrid = std::min(256, (int(n) + block - 1) / block);
+        ScopeHistogramKernel<<<hgrid, block, 0, ctx.stream>>>(
+            ctx.rgbFloat, int(n), ctx.scopeDev);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+
+    if (cudaStreamSynchronize(ctx.stream) != cudaSuccess) return false;
+    if (scope_out &&
+        cudaMemcpy(scope_out, ctx.scopeDev,
+                   size_t(kScopeSlots) * sizeof(uint32_t),
+                   cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+
+    ctx.rgbaW = W;
+    ctx.rgbaH = H;
+    ctx.rgbaValid = true;
+    *out_w = W;
+    *out_h = H;
+    return true;
+}
+
+#ifdef _WIN32
+namespace {
+// GL texture id -> cached CUDA registration. Guarded by gPreviewCtx.mtx
+// (blit / unregister / release all take it).
+std::unordered_map<unsigned int, cudaGraphicsResource_t> gGlTexRes;
+}
+
+bool BlitPreviewRgbaToGLTexture(unsigned int gl_texture, int* out_w, int* out_h) {
+    if (!IsCudaAvailable() || !out_w || !out_h) return false;
+    PipelineCtx& ctx = gPreviewCtx;
+    std::lock_guard<std::mutex> lock(ctx.mtx);
+    if (!ctx.rgbaValid || !ctx.rgbaDev) return false;
+
+    cudaGraphicsResource_t res = nullptr;
+    auto it = gGlTexRes.find(gl_texture);
+    if (it != gGlTexRes.end()) {
+        res = it->second;
+    } else {
+        if (cudaGraphicsGLRegisterImage(
+                &res, gl_texture, GL_TEXTURE_2D,
+                cudaGraphicsRegisterFlagsWriteDiscard) != cudaSuccess)
+            return false;
+        gGlTexRes.emplace(gl_texture, res);
+    }
+
+    if (cudaGraphicsMapResources(1, &res, 0) != cudaSuccess) return false;
+    cudaArray_t arr = nullptr;
+    bool ok = cudaGraphicsSubResourceGetMappedArray(&arr, res, 0, 0) == cudaSuccess;
+    if (ok) {
+        ok = cudaMemcpy2DToArray(
+                 arr, 0, 0, ctx.rgbaDev,
+                 size_t(ctx.rgbaW) * 4, size_t(ctx.rgbaW) * 4,
+                 size_t(ctx.rgbaH), cudaMemcpyDeviceToDevice) == cudaSuccess;
+    }
+    cudaGraphicsUnmapResources(1, &res, 0);
+    if (!ok) return false;
+    *out_w = ctx.rgbaW;
+    *out_h = ctx.rgbaH;
+    return true;
+}
+
+void UnregisterPreviewGLTexture(unsigned int gl_texture) {
+    std::lock_guard<std::mutex> lock(gPreviewCtx.mtx);
+    auto it = gGlTexRes.find(gl_texture);
+    if (it != gGlTexRes.end()) {
+        cudaGraphicsUnregisterResource(it->second);
+        gGlTexRes.erase(it);
+    }
+}
+
+void ReleaseGlInterop() {
+    std::lock_guard<std::mutex> lock(gPreviewCtx.mtx);
+    for (auto& kv : gGlTexRes) cudaGraphicsUnregisterResource(kv.second);
+    gGlTexRes.clear();
+    if (gPreviewCtx.rgbaDev) {
+        cudaFree(gPreviewCtx.rgbaDev);
+        gPreviewCtx.rgbaDev = nullptr;
+        gPreviewCtx.rgbaBytes = 0;
+        gPreviewCtx.rgbaValid = false;
+    }
+}
+#else
+bool BlitPreviewRgbaToGLTexture(unsigned int, int*, int*) { return false; }
+void UnregisterPreviewGLTexture(unsigned int) {}
+void ReleaseGlInterop() {}
+#endif
 
 bool ProcessBayerToNv12(
     const uint16_t* bayer_host,

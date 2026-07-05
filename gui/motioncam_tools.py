@@ -63,8 +63,10 @@ from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 # The real-time player lives in its own module. Import AFTER mcraw — player.py
 # imports mcraw directly and relies on _setup_paths() having already run.
 from player import (  # noqa: E402
+    HAVE_GL,
     AudioPlayer,
     FullscreenPreview,
+    GLPreview,
     PlaybackWorker,
     ScopePanel,
     transport_icon,
@@ -713,9 +715,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Real-time playback engine + transport state.
         self._player = PlaybackWorker()
         self._player.frame.connect(self._on_play_frame)
+        self._player.gl_frame.connect(self._on_gl_frame)
         self._player.scopes.connect(self._on_play_scopes)
         self._player.finished.connect(self._on_play_finished)
         self._scopes_on = bool(self._prefs.get("scopes_visible", False))
+        # Zero-readback GL display: available when CUDA + Qt OpenGL are both
+        # present. Fullscreen still uses the readback/QLabel path (v1).
+        self._gl_ok = bool(HAVE_GL and GLPreview is not None
+                           and mcraw.cuda_built() and mcraw.cuda_available())
         self._fs_window = None
         self._muted = False
         self._volume = 0.8
@@ -767,11 +774,25 @@ class MainWindow(QtWidgets.QMainWindow):
         pv = QtWidgets.QVBoxLayout(previewBox)
         pv.setContentsMargins(8, 4, 4, 4)
 
+        # Preview surface stack: page 0 is the QLabel (thumbs, CPU playback,
+        # readback GPU playback); page 1 is the zero-readback GL surface,
+        # shown only while a GL-mode playback is running.
         self.previewLabel = QtWidgets.QLabel("(select a file to preview)")
         self.previewLabel.setObjectName("previewLabel")
         self.previewLabel.setAlignment(QtCore.Qt.AlignCenter)
         self.previewLabel.setMinimumHeight(220)
-        pv.addWidget(self.previewLabel, 1)
+        self.previewStack = QtWidgets.QStackedWidget()
+        self.previewStack.addWidget(self.previewLabel)
+        self.glPreview = None
+        if self._gl_ok:
+            try:
+                self.glPreview = GLPreview()
+                self.previewStack.addWidget(self.glPreview)
+            except Exception as exc:
+                log.warning("GL preview unavailable: %s", _safe_error(exc))
+                self.glPreview = None
+                self._gl_ok = False
+        pv.addWidget(self.previewStack, 1)
 
         self.scrubSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
         self.scrubSlider.setRange(0, 0)
@@ -1885,19 +1906,37 @@ class MainWindow(QtWidgets.QMainWindow):
         if not (in_idx <= start < end - 1):
             start = in_idx                  # …unless it's outside the range / at the end
         preview_bin = int(self.previewQualityCombo.currentData() or 1)
+        # Zero-readback GL surface: GPU decode straight to a GL texture, no
+        # PCIe round trip, full-res preview. Fullscreen keeps the QLabel/
+        # readback path (its window has no GL surface in v1).
+        use_gl = bool(gpu and self._gl_ok and self.glPreview is not None
+                      and getattr(self, "_fs_window", None) is None)
         # Prepare the preview audio over the whole loop range [In, Out). It's
         # started later in _on_play_frame, but only while playback is real-time.
         self._prepare_audio(path, in_idx, end)
         self.playBtn.setIcon(self._icon_pause)
+        if use_gl:
+            self.previewStack.setCurrentWidget(self.glPreview)
         self._player.play(path, start, end, float(st["fps"]) or 30.0,
                           max_dim, self.vignetteCheck.isChecked(), gpu,
-                          preview_bin=preview_bin, loop_start=in_idx, loop=True)
+                          preview_bin=preview_bin, loop_start=in_idx, loop=True,
+                          use_gl=use_gl)
 
     def _stop_playback(self) -> None:
         self._player.stop()
         self._audio.stop()
         self.playBtn.setIcon(self._icon_play)
         self.playRateLabel.setText("")
+        self._leave_gl_surface()
+
+    def _leave_gl_surface(self) -> None:
+        """Return the preview stack to the QLabel page after GL playback and
+        refresh it with a decoded thumb of the current frame so the image
+        doesn't visibly jump back to a stale one."""
+        if self.glPreview is not None and \
+                self.previewStack.currentWidget() is self.glPreview:
+            self.previewStack.setCurrentWidget(self.previewLabel)
+            self._kick_thumb_decode()
 
     @QtCore.Slot()
     def _on_preview_quality_changed(self) -> None:
@@ -1917,6 +1956,11 @@ class MainWindow(QtWidgets.QMainWindow):
         if self._current_path() != path:
             self._audio.stop()   # worker still on the old clip — silence it
             return
+        # The worker may have silently fallen back from GL mode (e.g. interop
+        # failure) — make sure the QLabel surface is the one showing.
+        if self.glPreview is not None and \
+                self.previewStack.currentWidget() is self.glPreview:
+            self.previewStack.setCurrentWidget(self.previewLabel)
         st = self._file_state.get(path)
         if st is not None:
             st["scrub"] = idx
@@ -1926,16 +1970,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self.scrubSlider.blockSignals(False)
         total = st["total"] if st else idx + 1
         self.frameLabel.setText(f"Frame {idx + 1} / {total}")
-        # Real-time vs proxy indicator + audio auto-mute (Stage 3 wires audio).
+        self._playback_tick(idx, achieved, target, from_cache, gl=False)
+
+    @QtCore.Slot(str, int, int, int, float, float)
+    def _on_gl_frame(self, path: str, idx: int, w: int, h: int,
+                     achieved: float, target: float) -> None:
+        """Zero-readback frame: the pixels are already sitting in the device
+        display buffer — just size the GL surface and schedule its repaint."""
+        if self._current_path() != path:
+            self._audio.stop()
+            return
+        st = self._file_state.get(path)
+        if st is not None:
+            st["scrub"] = idx
+        if self.glPreview is not None:
+            if self.previewStack.currentWidget() is not self.glPreview:
+                self.previewStack.setCurrentWidget(self.glPreview)
+            self.glPreview.set_frame_size(w, h)
+            self.glPreview.update()
+        self.scrubSlider.blockSignals(True)
+        self.scrubSlider.setValue(idx)
+        self.scrubSlider.blockSignals(False)
+        total = st["total"] if st else idx + 1
+        self.frameLabel.setText(f"Frame {idx + 1} / {total}")
+        self._playback_tick(idx, achieved, target, False, gl=True)
+
+    def _playback_tick(self, idx: int, achieved: float, target: float,
+                       from_cache: bool, gl: bool) -> None:
+        """Shared per-frame tail for both display paths: real-time indicator
+        and the audio auto-mute hysteresis."""
         # A cache hit is delivered instantly, so it always counts as real-time;
         # a miss below target means we're still filling the cache this pass.
         realtime = from_cache or achieved >= target * 0.9
         self._playback_realtime = realtime
         if realtime:
             label = f"{min(achieved, target):.0f} fps"
-            if from_cache:
+            if gl:
+                label += " · GL"
+            elif from_cache:
                 label += " · cached"
-        elif not from_cache:
+        elif not from_cache and not gl:
             label = f"{achieved:.0f} fps · caching"
         else:
             label = f"{achieved:.0f} fps · slow"
@@ -1967,6 +2041,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_play_finished(self, path: str) -> None:
         self._audio.stop()
         self.playBtn.setIcon(self._icon_play)
+        self._leave_gl_surface()
 
     @QtCore.Slot(str, int, bytes, float, float)
     def _on_play_scopes(self, path: str, _idx: int, hist: bytes,
@@ -2074,9 +2149,16 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _toggle_fullscreen(self) -> None:
         # Pop the preview label out to a frameless fullscreen window; Esc/F/click
-        # returns it. Playback keeps running (same worker, same signal).
+        # returns it. Playback keeps running (same worker, same signal) — but
+        # the fullscreen surface is pixmap-based, so a GL-mode playback is
+        # restarted in readback mode for the duration (and back on exit).
+        was_playing = self._player.is_playing()
+        if was_playing:
+            self._stop_playback()
         if getattr(self, "_fs_window", None) is not None:
             self._exit_fullscreen()
+            if was_playing:
+                self._toggle_play()
             return
         fs = FullscreenPreview(self)
         fs.showFullScreen()
@@ -2085,6 +2167,8 @@ class MainWindow(QtWidgets.QMainWindow):
         st = self._file_state.get(self._current_path() or "")
         if st and st.get("thumb_img") is not None:
             fs.set_image(QtGui.QPixmap.fromImage(st["thumb_img"]))
+        if was_playing:
+            self._toggle_play()
 
     def _exit_fullscreen(self) -> None:
         fs = getattr(self, "_fs_window", None)
@@ -2497,6 +2581,13 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "_audio", None) is not None:
             self._audio.stop()
         self._exit_fullscreen()
+        # Release CUDA-GL interop state before the GL context goes away.
+        if getattr(self, "glPreview", None) is not None:
+            try:
+                self.glPreview.cleanup()
+                mcraw.gl_release()
+            except Exception:
+                pass
         event.accept()
 
 

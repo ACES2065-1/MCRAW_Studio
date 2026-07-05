@@ -32,6 +32,19 @@ except Exception as _exc:  # pragma: no cover
           file=_sys.stderr)
     _HAVE_QTMM = False
 
+# Zero-readback GL display path (Phase H). Optional the same way audio is:
+# if the Qt OpenGL modules are missing, HAVE_GL is False and the player
+# stays on the QImage readback path.
+try:
+    from PySide6.QtOpenGL import QOpenGLFramebufferObject
+    from PySide6.QtOpenGLWidgets import QOpenGLWidget
+    HAVE_GL = True
+except Exception as _exc:  # pragma: no cover
+    import sys as _sys
+    print(f"Qt OpenGL unavailable — GL preview disabled: {_exc}",
+          file=_sys.stderr)
+    HAVE_GL = False
+
 
 def _qimage_bytes(img: QtGui.QImage) -> int:
     """Best-effort byte size of a QImage (sizeInBytes on PySide6, byteCount on
@@ -289,6 +302,9 @@ class PlaybackWorker(QtCore.QObject):
     """
     # path, frame_idx, image, achieved_fps, target_fps, from_cache
     frame = QtCore.Signal(str, int, QtGui.QImage, float, float, bool)
+    # Zero-readback frame published to the device display buffer:
+    # path, frame_idx, frame_w, frame_h, achieved_fps, target_fps
+    gl_frame = QtCore.Signal(str, int, int, int, float, float)
     # path, frame_idx, hist_bytes (3*256 LE uint32), clip_lo, clip_hi
     scopes = QtCore.Signal(str, int, bytes, float, float)
     finished = QtCore.Signal(str)
@@ -335,18 +351,18 @@ class PlaybackWorker(QtCore.QObject):
     def play(self, path: str, start_idx: int, end_idx: int, fps: float,
              max_dim: int, bake_vignette: bool, prefer_gpu: bool,
              preview_bin: int = 1, loop_start: int | None = None,
-             loop: bool = True) -> None:
+             loop: bool = True, use_gl: bool = False) -> None:
         self.stop()
         self._stop.clear()
         self._thread = threading.Thread(
             target=self._run,
             args=(path, start_idx, end_idx, fps, max_dim, bake_vignette,
-                  prefer_gpu, preview_bin, loop_start, loop),
+                  prefer_gpu, preview_bin, loop_start, loop, use_gl),
             daemon=True)
         self._thread.start()
 
     def _run(self, path, start_idx, end_idx, fps, max_dim, bake, prefer_gpu,
-             preview_bin, loop_start, loop):
+             preview_bin, loop_start, loop, use_gl=False):
         try:
             d = mcraw.Decoder(path)
             ts = d.frames
@@ -365,6 +381,12 @@ class PlaybackWorker(QtCore.QObject):
         use_gpu = bool(prefer_gpu and mcraw.cuda_available())
         preview_bin = max(1, int(preview_bin))
         want_scopes = bool(self._scopes_enabled)
+        # Zero-readback GL mode: only meaningful on the GPU path, and it
+        # bypasses the QImage cache entirely (there is nothing host-side to
+        # cache — the GPU redecodes faster than real-time, which is the point).
+        # Any per-frame failure drops us back to the readback path for the
+        # rest of this run.
+        gl_mode = bool(use_gl and use_gpu)
         # Point the live cache at this clip+params. The first pass decodes &
         # fills it (may run below real-time); replays and later loop passes read
         # it back, so they hit the target rate even on a slow CPU path. The bin
@@ -374,6 +396,37 @@ class PlaybackWorker(QtCore.QObject):
                                    preview_bin, want_scopes))
         while not self._stop.is_set():
             t0 = time.perf_counter()
+
+            if gl_mode:
+                try:
+                    res = d.process_frame_gl(ts[idx], "srgb", False, bake,
+                                             preview_bin, want_scopes)
+                except Exception as exc:
+                    print(f"[play] GL decode failed frame {idx}: {exc}")
+                    res = None
+                if res is None:
+                    gl_mode = False   # fall back to readback below
+                else:
+                    if want_scopes:
+                        h, w, hist, clip_lo, clip_hi = res
+                    else:
+                        h, w = res
+                        hist = None
+                    dt = time.perf_counter() - t0
+                    achieved = (1.0 / dt) if dt > 0 else fps
+                    self.gl_frame.emit(path, idx, w, h, achieved, fps)
+                    if want_scopes and hist is not None:
+                        self.scopes.emit(path, idx, hist, clip_lo, clip_hi)
+                    idx += 1
+                    if idx >= end_idx:
+                        if not loop:
+                            break
+                        idx = loop_back
+                    sleep = period - (time.perf_counter() - t0)
+                    if sleep > 0:
+                        self._stop.wait(sleep)
+                    continue
+
             entry = self._cache.get(idx)
             from_cache = entry is not None
             if from_cache:
@@ -454,6 +507,90 @@ class FullscreenPreview(QtWidgets.QWidget):
 
     def mouseDoubleClickEvent(self, e: QtGui.QMouseEvent) -> None:
         self._owner._exit_fullscreen()
+
+
+if HAVE_GL:
+    class GLPreview(QOpenGLWidget):
+        """Zero-readback preview surface (Phase H).
+
+        The playback thread decodes into a device-resident RGBA buffer
+        (Decoder.process_frame_gl — no PCIe readback); the GUI thread, inside
+        paintGL where this widget's GL context is current, asks CUDA to copy
+        that buffer into our FBO's texture (mcraw.gl_blit, a device-to-device
+        transfer) and blits the FBO to the screen letterboxed. The frame
+        never crosses the bus.
+        """
+
+        _GL_READ_FRAMEBUFFER = 0x8CA8
+        _GL_DRAW_FRAMEBUFFER = 0x8CA9
+        _GL_COLOR_BUFFER_BIT = 0x00004000
+        _GL_LINEAR           = 0x2601
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._fbo = None
+            self._frame_w = 0
+            self._frame_h = 0
+
+        def set_frame_size(self, w: int, h: int) -> None:
+            """Called (GUI thread) when the worker publishes a frame; resizes
+            the FBO lazily inside paintGL if the source size changed."""
+            self._frame_w = int(w)
+            self._frame_h = int(h)
+
+        def _ensure_fbo(self) -> bool:
+            if self._frame_w <= 0 or self._frame_h <= 0:
+                return False
+            if (self._fbo is not None
+                    and self._fbo.width() == self._frame_w
+                    and self._fbo.height() == self._frame_h):
+                return True
+            if self._fbo is not None:
+                try:
+                    mcraw.gl_unregister(int(self._fbo.texture()))
+                except Exception:
+                    pass
+                self._fbo = None
+            self._fbo = QOpenGLFramebufferObject(self._frame_w, self._frame_h)
+            return self._fbo.isValid()
+
+        def paintGL(self) -> None:
+            ctx = self.context()
+            f = ctx.extraFunctions()
+            f.glClearColor(0.0, 0.0, 0.0, 1.0)
+            f.glClear(self._GL_COLOR_BUFFER_BIT)
+            if not self._ensure_fbo():
+                return
+            res = mcraw.gl_blit(int(self._fbo.texture()))
+            if res is None:
+                return
+            fw, fh = res
+            # Letterbox the frame into the widget (device pixels), flipping Y
+            # (GL textures are bottom-up, our rows are top-down).
+            dpr = self.devicePixelRatioF()
+            ww, wh = int(self.width() * dpr), int(self.height() * dpr)
+            if ww <= 0 or wh <= 0 or fw <= 0 or fh <= 0:
+                return
+            scale = min(ww / fw, wh / fh)
+            dw, dh = int(fw * scale), int(fh * scale)
+            dx, dy = (ww - dw) // 2, (wh - dh) // 2
+            f.glBindFramebuffer(self._GL_READ_FRAMEBUFFER, self._fbo.handle())
+            f.glBindFramebuffer(self._GL_DRAW_FRAMEBUFFER,
+                                self.defaultFramebufferObject())
+            f.glBlitFramebuffer(0, fh, fw, 0,          # src flipped in Y
+                                dx, dy, dx + dw, dy + dh,
+                                self._GL_COLOR_BUFFER_BIT, self._GL_LINEAR)
+
+        def cleanup(self) -> None:
+            """Release the CUDA registration before the GL resources die."""
+            if self._fbo is not None:
+                try:
+                    mcraw.gl_unregister(int(self._fbo.texture()))
+                except Exception:
+                    pass
+                self._fbo = None
+else:  # pragma: no cover — Qt OpenGL modules missing
+    GLPreview = None
 
 
 class ScopePanel(QtWidgets.QWidget):

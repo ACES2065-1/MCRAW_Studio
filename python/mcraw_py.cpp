@@ -278,6 +278,71 @@ public:
                          bake_vignette, prefer_gpu, preview_bin, false);
     }
 
+    // Phase H zero-readback display: run the preview chain on the GPU and
+    // leave the frame in the device-side RGBA display buffer (no PCIe
+    // readback; the GUI thread blits it into a GL texture via gl_blit).
+    // Returns None when the GPU path can't run (no CUDA, OCIO-only target)
+    // so the caller falls back to process_frame_rgb24. Otherwise returns
+    // (height, width) or, with want_scopes, (height, width, hist_bytes,
+    // clip_lo, clip_hi).
+    py::object process_frame_gl(int64_t timestamp, const std::string& colorspace,
+                                bool highlight_recovery, bool bake_vignette,
+                                int preview_bin, bool want_scopes) {
+#if !MCRAW_HAVE_CUDA
+        (void)timestamp; (void)colorspace; (void)highlight_recovery;
+        (void)bake_vignette; (void)preview_bin; (void)want_scopes;
+        return py::none();
+#else
+        if (!motioncam::cuda::IsCudaAvailable()) return py::none();
+        mcc::OutputColorSpace cs;
+        if (!mcc::ParseOutputColorSpace(colorspace, cs))
+            throw std::runtime_error("unknown color space: " + colorspace);
+
+        std::vector<uint32_t> scopes;
+        if (want_scopes) scopes.assign(size_t(motioncam::cuda::kScopeSlots), 0u);
+
+        std::vector<uint8_t> rawBuf;
+        nlohmann::json frameMeta;
+        std::vector<uint16_t> binnedBayer;
+        int outW = 0, outH = 0;
+        bool ok = false;
+        {
+            py::gil_scoped_release release;
+            d_->loadFrame(timestamp, rawBuf, frameMeta);
+            auto params = mcc::BuildFrameParams(frameMeta, d_->getContainerMetadata());
+            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
+            if (preview_bin > 1) {
+                uint32_t bw = 0, bh = 0;
+                SubsampleBayerCells(raw, params.width, params.height, preview_bin,
+                                    binnedBayer, bw, bh);
+                if (!binnedBayer.empty()) {
+                    raw = binnedBayer.data();
+                    params.width = bw;
+                    params.height = bh;
+                }
+            }
+            motioncam::cuda::BayerPipelineConstants C{};
+            if (BuildBakedBayerConstants(params, cs, C)) {
+                C.highlight_recovery = highlight_recovery ? 1 : 0;
+                C.highlight_rolloff  =
+                    (highlight_recovery && mcc::IsDisplayEncoded(cs)) ? 1 : 0;
+                if (!bake_vignette) { C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr; }
+                ok = motioncam::cuda::ProcessBayerToRgbaDevice(
+                    raw, params.asShotNeutral, C, &outW, &outH,
+                    want_scopes ? scopes.data() : nullptr);
+            }
+        }
+        if (!ok) return py::none();
+        if (!want_scopes) return py::make_tuple(outH, outW);
+        const double pixels = double(outW) * double(outH);
+        const double clipLo = pixels > 0 ? scopes[768] / pixels : 0.0;
+        const double clipHi = pixels > 0 ? scopes[769] / pixels : 0.0;
+        std::string histBytes(reinterpret_cast<const char*>(scopes.data()),
+                              size_t(3 * 256) * sizeof(uint32_t));
+        return py::make_tuple(outH, outW, py::bytes(histBytes), clipLo, clipHi);
+#endif
+    }
+
     // Scoped sibling for the player's scopes panel: returns
     // (rgb_bytes, height, width, hist_bytes, clip_lo, clip_hi) where
     // hist_bytes is 3*256 little-endian uint32 (R,G,B bins over the
@@ -895,6 +960,14 @@ PYBIND11_MODULE(mcraw, m) {
              "prefer_gpu uses the CUDA bayer pipeline for baked targets (real-time preview). "
              "preview_bin>1 decimates the Bayer to 1/bin resolution first (preview proxy, "
              "~1/bin^2 the per-pixel cost) for low-end machines.")
+        .def("process_frame_gl", &PyDecoder::process_frame_gl,
+             py::arg("timestamp"), py::arg("colorspace") = "srgb",
+             py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
+             py::arg("preview_bin") = 1, py::arg("want_scopes") = false,
+             "Zero-readback preview decode: run the GPU chain and leave RGBA8 "
+             "in the device display buffer for gl_blit(). Returns None if the "
+             "GPU path is unavailable (fall back to process_frame_rgb24); else "
+             "(height, width) or (height, width, hist, clip_lo, clip_hi).")
         .def("process_frame_rgb24_scopes", &PyDecoder::process_frame_rgb24_scopes,
              py::arg("timestamp"), py::arg("colorspace") = "srgb",
              py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
@@ -1380,6 +1453,41 @@ frame_rate_conversion: target fps to convert to (duplicate/drop to keep A/V
         "(H, W, 3) RGB in the target OCIO space. For correctness testing "
         "against process_frame.");
 #endif
+
+    // ---- Phase H: CUDA-GL blit (GUI thread, GL context must be current) ----
+    m.def("gl_blit", [](unsigned int texture_id) -> py::object {
+#if MCRAW_HAVE_CUDA
+        int w = 0, h = 0;
+        bool ok;
+        {
+            py::gil_scoped_release release;
+            ok = motioncam::cuda::BlitPreviewRgbaToGLTexture(texture_id, &w, &h);
+        }
+        if (!ok) return py::none();
+        return py::make_tuple(w, h);
+#else
+        (void)texture_id;
+        return py::none();
+#endif
+    }, py::arg("texture_id"),
+       "Copy the most recent process_frame_gl frame into the given RGBA8 "
+       "GL_TEXTURE_2D (device-to-device; the texture's GL context must be "
+       "current on this thread). Returns (width, height) or None.");
+
+    m.def("gl_unregister", [](unsigned int texture_id) {
+#if MCRAW_HAVE_CUDA
+        motioncam::cuda::UnregisterPreviewGLTexture(texture_id);
+#else
+        (void)texture_id;
+#endif
+    }, py::arg("texture_id"),
+       "Drop the cached CUDA registration for a GL texture about to be destroyed.");
+
+    m.def("gl_release", []() {
+#if MCRAW_HAVE_CUDA
+        motioncam::cuda::ReleaseGlInterop();
+#endif
+    }, "Free all CUDA-GL interop state (registrations + device display buffer).");
 
     m.def("encoder_available", [](const std::string& name) -> bool {
         // Two-step check: codec compiled into FFmpeg, AND it can actually open
