@@ -1,20 +1,36 @@
 name: build
 
-# Fast PR / push smoke build. Compiles the core decoder + example so we catch
-# obvious breakage (container parsing, RawData compression, Trimmer) without
-# pulling the full vcpkg dependency tree (OpenEXR + OCIO + FFmpeg + pybind11)
-# which takes ~30 min cold and complicates caching.
+# Two tiers:
 #
-# To validate the full render pipeline (mcraw_render + Python module) you
-# currently still need to build locally — that's documented in CONTRIBUTING.md.
-# If PR volume grows enough to justify it, extend this workflow with a second
-# job that does the full vcpkg-backed build with GHA binary caching.
+#   windows-core      — fast smoke build of the decoder + example (no vcpkg).
+#                       Catches container-parsing / RawData / Trimmer breakage
+#                       in a couple of minutes.
+#
+#   windows-pipeline  — full CPU pipeline regression. Builds mcraw_render +
+#                       the mcraw Python module against a CI-only vcpkg
+#                       manifest (.github/vcpkg/vcpkg.json), then runs
+#                       test/smoke.py and test/player_preview_verify.py
+#                       against the committed 2-frame fixture clip. NVENC
+#                       smoke cases auto-skip (no GPU on runners); GPU parity
+#                       checks in the verify script skip the same way. This
+#                       is the net that keeps Phases C–F honest: any change
+#                       to the bayer chain, color math, or encoder that
+#                       breaks a render fails this job.
+#
+# The first pipeline run compiles FFmpeg/x265/OpenEXR/OCIO from source
+# (~60-90 min). vcpkg's binary cache is persisted via actions/cache, so
+# subsequent runs restore prebuilt archives and finish in ~10 min.
 
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   windows-core:
@@ -50,3 +66,64 @@ jobs:
           & $exe 2>&1 | Out-String | Write-Host
           # Treat any exit code as a pass — we only care that it didn't crash.
           exit 0
+
+  windows-pipeline:
+    name: Windows / CPU pipeline regression
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    env:
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-bincache
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python deps
+        run: python -m pip install --upgrade pip numpy
+
+      - name: Prepare vcpkg binary cache dir
+        run: New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      - name: Restore vcpkg binary cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DEFAULT_BINARY_CACHE }}
+          key: vcpkg-bin-${{ runner.os }}-${{ hashFiles('.github/vcpkg/vcpkg.json') }}
+          restore-keys: |
+            vcpkg-bin-${{ runner.os }}-
+
+      - name: Configure (full render pipeline, CPU-only)
+        # Uses the runner's preinstalled vcpkg in manifest mode, pointed at
+        # the CI-only manifest so local classic-mode builds stay untouched.
+        # CUDA is off — runners have no NVIDIA toolkit or GPU.
+        run: |
+          $py = (Get-Command python).Source
+          cmake -B build -S . `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT\scripts\buildsystems\vcpkg.cmake" `
+            -DVCPKG_MANIFEST_DIR="$PWD\.github\vcpkg" `
+            -DMCRAW_ENABLE_CUDA=OFF `
+            -DPython_EXECUTABLE="$py"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Install ffprobe
+        run: choco install ffmpeg -y --no-progress
+
+      - name: Pipeline smoke (render every codec, ffprobe outputs)
+        env:
+          MCRAW_BUILD_DIR: ${{ github.workspace }}\build\Release
+          MCRAW_DLL_DIR: ${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin
+        run: python test/smoke.py test/fixtures/smoke2.mcraw
+
+      - name: Player preview verification (CPU checks)
+        env:
+          MCRAW_BUILD_DIR: ${{ github.workspace }}\build\Release
+          MCRAW_DLL_DIR: ${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin
+        run: python test/player_preview_verify.py test/fixtures/smoke2.mcraw

@@ -53,6 +53,9 @@ desktop.ini
 # .mcraw clips and rendered samples don't belong in the repo (multi-GB).
 # Drop them next to the source on disk; they're for local testing only.
 *.mcraw
+# Exception: the tiny 2-frame fixture the CI pipeline-regression job
+# renders against (see .github/workflows/build.yml).
+!test/fixtures/smoke2.mcraw
 *.mp4
 *.mov
 *.exr

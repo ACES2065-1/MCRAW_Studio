@@ -35,8 +35,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
-BUILD = PROJECT / "build"
-VCPKG_BIN = Path(r"C:\dev\vcpkg\installed\x64-windows\bin")
+# CI overrides: MCRAW_BUILD_DIR (mcraw*.pyd dir), MCRAW_DLL_DIR (runtime DLLs).
+BUILD = Path(os.environ.get("MCRAW_BUILD_DIR", PROJECT / "build"))
+VCPKG_BIN = Path(os.environ.get("MCRAW_DLL_DIR",
+                                r"C:\dev\vcpkg\installed\x64-windows\bin"))
 
 if VCPKG_BIN.is_dir() and hasattr(os, "add_dll_directory"):
     os.add_dll_directory(str(VCPKG_BIN))

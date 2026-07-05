@@ -42,8 +42,12 @@ from pathlib import Path
 # without installing anything. Mirror what gui/motioncam_tools.py does.
 HERE = Path(__file__).resolve().parent
 PROJECT = HERE.parent
-BUILD = PROJECT / "build"
-VCPKG_BIN = Path(r"C:\dev\vcpkg\installed\x64-windows\bin")
+# CI (or an unusual local layout) can override both locations:
+#   MCRAW_BUILD_DIR — directory containing mcraw*.pyd
+#   MCRAW_DLL_DIR   — directory containing the FFmpeg / OpenEXR / OCIO DLLs
+BUILD = Path(os.environ.get("MCRAW_BUILD_DIR", PROJECT / "build"))
+VCPKG_BIN = Path(os.environ.get("MCRAW_DLL_DIR",
+                                r"C:\dev\vcpkg\installed\x64-windows\bin"))
 
 if VCPKG_BIN.is_dir() and hasattr(os, "add_dll_directory"):
     os.add_dll_directory(str(VCPKG_BIN))
@@ -111,11 +115,24 @@ def ffprobe_streams(path: Path) -> list[dict]:
 
 class Case:
     """One render-and-check scenario."""
-    def __init__(self, name, *, output_ext, expect_streams, **render_kwargs):
+    def __init__(self, name, *, output_ext, expect_streams,
+                 requires_encoder=None, **render_kwargs):
         self.name = name
         self.output_ext = output_ext              # ".mp4" / ".mov" / "" (dir)
         self.expect_streams = expect_streams      # list of expected codec_types
+        # FFmpeg encoder that must open on this machine, else the case is
+        # SKIPPED (not failed). Lets the suite run on GPU-less CI runners —
+        # the NVENC cases need an NVIDIA driver.
+        self.requires_encoder = requires_encoder
         self.render_kwargs = render_kwargs        # passed to mcraw.render
+
+    def available(self) -> bool:
+        if not self.requires_encoder:
+            return True
+        try:
+            return bool(mcraw.encoder_available(self.requires_encoder))
+        except Exception:
+            return False
 
     def run(self, fixture: Path, tmpdir: Path) -> tuple[bool, str]:
         out = tmpdir / f"out_{self.name}{self.output_ext}"
@@ -201,7 +218,8 @@ CASES = [
     Case("mp4_h265nvenc_acescct",
          output_ext=".mp4",
          expect_streams=["video", "audio"],
-         colorspace="acescct", codec="h265_nvenc", start=0, end=8, bitrate=40),
+         colorspace="acescct", codec="h265_nvenc", start=0, end=8, bitrate=40,
+         requires_encoder="hevc_nvenc"),
 
     # 10-bit Main10 via NVENC — exercises the Phase E.1 GPU P010 kernel when
     # MCRAW_GPU_YUV=1, the CPU sws->P010 path otherwise.
@@ -209,7 +227,7 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="acescg", codec="h265_nvenc", start=0, end=8, bitrate=60,
-         ten_bit=True),
+         ten_bit=True, requires_encoder="hevc_nvenc"),
 
     # Highlight recovery via NVENC — exercises the Phase E.3 GPU highlight
     # kernels when MCRAW_GPU_YUV=1 (the libx264 recovery case above stays on
@@ -218,7 +236,7 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="srgb", codec="h265_nvenc", start=0, end=8, bitrate=40,
-         highlight_recovery=True),
+         highlight_recovery=True, requires_encoder="hevc_nvenc"),
 
     # Rec.2020 PQ HDR via NVENC — exercises the Phase E.2 GPU BT.2020 matrix
     # (+ Phase D LUT + P010) when MCRAW_GPU_YUV=1. 10-bit Main10.
@@ -226,7 +244,7 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="rec2020-pq", codec="h265_nvenc", start=0, end=8,
-         bitrate=60, ten_bit=True),
+         bitrate=60, ten_bit=True, requires_encoder="hevc_nvenc"),
 
     # AV1 NVENC (RTX 40-series+). Same GPU NV12/P010 path as HEVC; this case
     # guards the AV1-specific encoder wiring. Will fail on GPUs without AV1
@@ -234,7 +252,8 @@ CASES = [
     Case("mp4_av1nvenc_srgb",
          output_ext=".mp4",
          expect_streams=["video", "audio"],
-         colorspace="srgb", codec="av1_nvenc", start=0, end=8, bitrate=30),
+         colorspace="srgb", codec="av1_nvenc", start=0, end=8, bitrate=30,
+         requires_encoder="av1_nvenc"),
 
     # Denoise via NVENC (MP4-only) — exercises the Phase F GPU denoise kernels
     # when MCRAW_GPU_YUV=1, the CPU DenoiseRgb otherwise.
@@ -242,7 +261,7 @@ CASES = [
          output_ext=".mp4",
          expect_streams=["video", "audio"],
          colorspace="srgb", codec="h265_nvenc", start=0, end=8, bitrate=30,
-         denoise_chroma=60, denoise_luma=40),
+         denoise_chroma=60, denoise_luma=40, requires_encoder="hevc_nvenc"),
 ]
 
 
@@ -277,7 +296,13 @@ def main() -> int:
     print(f"Working in: {tmpdir}\n")
 
     results: list[tuple[str, bool, str]] = []
+    skipped = 0
     for case in CASES:
+        if not case.available():
+            print(f"  [SKIP] {case.name:36s} requires encoder "
+                  f"{case.requires_encoder} (not usable on this machine)")
+            skipped += 1
+            continue
         print(f"  [...] {case.name:36s}", end="", flush=True)
         ok, msg = case.run(fixture, tmpdir)
         marker = "PASS" if ok else "FAIL"
@@ -291,7 +316,8 @@ def main() -> int:
     print()
     passed = sum(1 for _, ok, _ in results if ok)
     total = len(results)
-    print(f"{passed}/{total} passed")
+    tail = f"  ({skipped} skipped)" if skipped else ""
+    print(f"{passed}/{total} passed{tail}")
 
     if passed < total:
         print("\nFailed cases:")

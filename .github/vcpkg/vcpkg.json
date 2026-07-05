@@ -1,0 +1,16 @@
+{
+  "$comment": "CI-only vcpkg manifest. Lives OUTSIDE the project root on purpose: dropping a vcpkg.json at the root would flip local configure.bat builds into manifest mode and ignore the dev box's classic-mode installed tree. CI points the toolchain here via -DVCPKG_MANIFEST_DIR.",
+  "name": "mcraw-studio-ci",
+  "version-string": "ci",
+  "dependencies": [
+    "imath",
+    "openexr",
+    "opencolorio",
+    "pybind11",
+    {
+      "name": "ffmpeg",
+      "default-features": true,
+      "features": ["gpl", "x264", "x265"]
+    }
+  ]
+}
