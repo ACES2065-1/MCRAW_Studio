@@ -22,6 +22,18 @@ isn't code-signed yet; click *More info* → *Run anyway*.
 
 - **Drag-and-drop bulk transcode** of `.mcraw` files, with per-clip in/out
   scrubbing and a frame preview
+- **Real-time preview player** (v0.7) — play/pause, Premiere-style bracket
+  In/Out marks, volume with auto-mute when playback isn't real-time,
+  fullscreen, and a 1/N proxy quality selector for slower machines. On
+  NVIDIA GPUs the frame goes camera-RAW → debayer → color → **straight to
+  the screen without ever leaving the GPU** (CUDA→OpenGL); other machines
+  get an adaptive CPU proxy path with a RAM playback cache
+- **RGB scopes** (v0.7) — log histogram of the displayed image plus
+  highlight/shadow clipping percentages measured on the pre-quantize float
+  signal, live during playback and scrubbing
+- **Malvar-He-Cutler demosaic** (v0.7) — gradient-corrected debayer replaces
+  bilinear on both the CPU and GPU pipelines; noticeably less zipper and
+  color fringing on high-contrast edges
 - **Outputs**:
   - **MP4** (H.264 / H.265 / AV1) — for delivery and "normal video" playback
   - **MOV** (ProRes 422 / 422 HQ / 4444 / 4444 XQ, DNxHR HQX / 444, CineForm)
