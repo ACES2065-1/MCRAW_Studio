@@ -40,6 +40,8 @@ namespace {
 uint16_t*    gBayerU16   = nullptr;   // width*height  u16
 float*       gBayerFloat = nullptr;   // width*height  float
 float*       gRgbFloat   = nullptr;   // width*height*3 float
+uint8_t*     gRgb8       = nullptr;   // width*height*3 u8 (preview readback)
+size_t       gRgb8Bytes  = 0;
 int          gBufW       = 0;
 int          gBufH       = 0;
 // LSM scratch: re-allocated when grid dimensions change. Tiny (a few KB
@@ -141,6 +143,7 @@ void ReleaseBayerPipeline() {
     if (gBayerU16)   { cudaFree(gBayerU16);   gBayerU16   = nullptr; }
     if (gBayerFloat) { cudaFree(gBayerFloat); gBayerFloat = nullptr; }
     if (gRgbFloat)   { cudaFree(gRgbFloat);   gRgbFloat   = nullptr; }
+    if (gRgb8)       { cudaFree(gRgb8);        gRgb8       = nullptr; gRgb8Bytes = 0; }
     if (gLsmDevice)  { cudaFree(gLsmDevice);  gLsmDevice  = nullptr; }
     ReleaseDenoiseLocked();
     gBufW = 0;
@@ -872,6 +875,53 @@ bool ProcessBayerToRgb(
     // Copy the result to host for the Python correctness bindings.
     if (cudaMemcpy(rgb_host_out, gRgbFloat, n * 3 * sizeof(float),
                    cudaMemcpyDeviceToHost) != cudaSuccess)
+        return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+}
+
+// Preview: clamp float RGB [0,1] -> uint8 RGB888 (n = pixels*3 components).
+__global__ void RgbFloatToU8Kernel(const float* __restrict__ rgb,
+                                   uint8_t* __restrict__ out, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float v = rgb[i];
+    v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    out[i] = static_cast<uint8_t>(v * 255.0f + 0.5f);
+}
+
+bool ProcessBayerToRgb8(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    uint8_t* rgb8_host_out)
+{
+    // Preview fast path: full bayer chain on GPU, then clamp to 8-bit RGB888
+    // and read back (≈ width*height*3 bytes — far less than the float buffer).
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !rgb8_host_out || !wb) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
+
+    const int W = C.width, H = C.height;
+    const size_t n = size_t(W) * size_t(H);
+    const size_t bytes = n * 3;
+
+    std::lock_guard<std::mutex> lock(gBufMutex);
+    if (!EnsureBuffers(W, H)) return false;
+    if (gRgb8Bytes != bytes || !gRgb8) {
+        if (gRgb8) { cudaFree(gRgb8); gRgb8 = nullptr; }
+        if (cudaMalloc(reinterpret_cast<void**>(&gRgb8), bytes) != cudaSuccess) {
+            gRgb8 = nullptr; gRgb8Bytes = 0; return false;
+        }
+        gRgb8Bytes = bytes;
+    }
+    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+
+    const int total = int(bytes);
+    const int block = 256;
+    const int grid = (total + block - 1) / block;
+    RgbFloatToU8Kernel<<<grid, block>>>(gRgbFloat, gRgb8, total);
+    if (cudaGetLastError() != cudaSuccess) return false;
+    if (cudaMemcpy(rgb8_host_out, gRgb8, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
         return false;
     return cudaDeviceSynchronize() == cudaSuccess;
 }

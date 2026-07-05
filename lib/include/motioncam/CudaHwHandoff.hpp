@@ -183,6 +183,15 @@ bool ProcessBayerToRgb(
     const BayerPipelineConstants& consts,
     float* rgb_host_out);
 
+// Preview variant: runs the same chain but returns clamped 8-bit RGB888 to
+// host (width*height*3 bytes). Used by the GUI real-time player so the
+// per-frame readback is small. Returns false on any CUDA error.
+bool ProcessBayerToRgb8(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    uint8_t* rgb8_host_out);
+
 // Phase C.2 entry point. Same bayer pipeline as ProcessBayerToRgb but
 // instead of copying the result to host, hands the GPU RGB straight to
 // the Phase B RGB->NV12 kernel and writes the result into the caller-

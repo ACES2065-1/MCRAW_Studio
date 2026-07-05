@@ -65,6 +65,135 @@ py::object JsonToPy(const nlohmann::json& j) {
     return py::none();
 }
 
+// Cell-wise Bayer subsample for the real-time preview proxy. Copies every
+// `bin`-th 2x2 CFA cell intact, so the result is a smaller mosaic with the
+// SAME CFA pattern, black levels and white balance — the existing debayer /
+// colour / lens-shading code (CPU and GPU) runs unchanged, just on far fewer
+// pixels (a 1/N proxy costs ~1/N^2 of the per-pixel work). This is nearest-cell
+// decimation: fast and a little aliased, which is exactly what a preview wants.
+// `bin` >= 2; `outW/outH` return the reduced dimensions. If the frame is too
+// small to yield even one output cell, `dst` is left empty and the caller keeps
+// full resolution.
+void SubsampleBayerCells(const uint16_t* src, uint32_t W, uint32_t H, int bin,
+                         std::vector<uint16_t>& dst,
+                         uint32_t& outW, uint32_t& outH) {
+    const uint32_t oCellsW = (W / 2u) / uint32_t(bin);
+    const uint32_t oCellsH = (H / 2u) / uint32_t(bin);
+    if (oCellsW == 0u || oCellsH == 0u) { dst.clear(); outW = W; outH = H; return; }
+    outW = oCellsW * 2u;
+    outH = oCellsH * 2u;
+    dst.resize(size_t(outW) * size_t(outH));
+    const uint32_t step = uint32_t(bin) * 2u;   // source pixels spanned per cell
+    for (uint32_t cy = 0; cy < oCellsH; ++cy) {
+        const uint32_t sy = cy * step;
+        const uint16_t* s0 = src + size_t(sy)        * W;
+        const uint16_t* s1 = src + size_t(sy + 1u)   * W;
+        uint16_t* d0 = dst.data() + size_t(cy * 2u)      * outW;
+        uint16_t* d1 = dst.data() + size_t(cy * 2u + 1u) * outW;
+        for (uint32_t cx = 0; cx < oCellsW; ++cx) {
+            const uint32_t sx = cx * step;
+            const uint32_t dx = cx * 2u;
+            d0[dx]      = s0[sx];        // CFA (0,0)
+            d0[dx + 1u] = s0[sx + 1u];  // CFA (1,0)
+            d1[dx]      = s1[sx];        // CFA (0,1)
+            d1[dx + 1u] = s1[sx + 1u];  // CFA (1,1)
+        }
+    }
+}
+
+#if MCRAW_HAVE_CUDA
+// Build the GPU bayer-pipeline constants for a BakedTransform target
+// (cam->output matrix + curve). Returns false when `cs` is OCIO-only (no
+// baked transform) — the caller should then use the CPU path. Mirrors the
+// math in ColorPipeline.cpp / BakedTransform.cpp (same chain the CPU uses).
+bool BuildBakedBayerConstants(const mcc::FrameParams& params,
+                              mcc::OutputColorSpace cs,
+                              motioncam::cuda::BayerPipelineConstants& C) {
+    if (!mcc::HasBakedTransform(cs)) return false;
+
+    constexpr float Bradford_D50_to_D60[9] = {
+         0.96766f, -0.01686f,  0.04424f,
+        -0.02099f,  1.00778f,  0.01477f,
+         0.00853f, -0.01415f,  1.22963f,
+    };
+    constexpr float XYZ_D60_to_AP1[9] = {
+         1.6410233797f, -0.3248032942f, -0.2364246952f,
+        -0.6636628587f,  1.6153315917f,  0.0167563477f,
+         0.0117218943f, -0.0082844420f,  0.9883948585f,
+    };
+    auto matMul = [](const float A[9], const float B[9], float out[9]) {
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                out[i*3+j] = A[i*3+0]*B[j] + A[i*3+1]*B[3+j] + A[i*3+2]*B[6+j];
+    };
+    float tmp[9], camToAcescg[9];
+    matMul(Bradford_D50_to_D60, params.forwardMatrix2, tmp);
+    matMul(XYZ_D60_to_AP1, tmp, camToAcescg);
+
+    static const float M_Rec709[9] = {
+         1.7050514f, -0.6217908f, -0.0832606f,
+        -0.1302561f,  1.1408047f, -0.0105486f,
+        -0.0240083f, -0.1289693f,  1.1529777f,
+    };
+    static const float M_AP0[9] = {
+         0.6954522f,  0.1406787f,  0.1638691f,
+         0.0447946f,  0.8596711f,  0.0955343f,
+        -0.0055258f,  0.0040252f,  1.0015007f,
+    };
+    const float* bakedM = nullptr;
+    int curveCode = 0;  // 0 None, 1 Gamma22, 2 Gamma24, 3 SRGB
+    switch (cs) {
+        case mcc::OutputColorSpace::ACEScg:        bakedM = nullptr;   curveCode = 0; break;
+        case mcc::OutputColorSpace::LinearRec709:  bakedM = M_Rec709;  curveCode = 0; break;
+        case mcc::OutputColorSpace::ACES2065_1:    bakedM = M_AP0;     curveCode = 0; break;
+        case mcc::OutputColorSpace::Rec709Gamma22: bakedM = M_Rec709;  curveCode = 1; break;
+        case mcc::OutputColorSpace::Rec709Display: bakedM = M_Rec709;  curveCode = 2; break;
+        case mcc::OutputColorSpace::SRGB:          bakedM = M_Rec709;  curveCode = 3; break;
+        default: return false;
+    }
+    float fullMatrix[9];
+    if (bakedM) matMul(bakedM, camToAcescg, fullMatrix);
+    else        std::memcpy(fullMatrix, camToAcescg, sizeof(fullMatrix));
+
+    int chMap[4], cfaToLsm[4];
+    switch (params.cfa) {
+        case mcc::CfaPattern::RGGB:
+            chMap[0]=0; chMap[1]=1; chMap[2]=1; chMap[3]=2;
+            cfaToLsm[0]=0; cfaToLsm[1]=1; cfaToLsm[2]=2; cfaToLsm[3]=3; break;
+        case mcc::CfaPattern::BGGR:
+            chMap[0]=2; chMap[1]=1; chMap[2]=1; chMap[3]=0;
+            cfaToLsm[0]=3; cfaToLsm[1]=2; cfaToLsm[2]=1; cfaToLsm[3]=0; break;
+        case mcc::CfaPattern::GRBG:
+            chMap[0]=1; chMap[1]=0; chMap[2]=2; chMap[3]=1;
+            cfaToLsm[0]=1; cfaToLsm[1]=0; cfaToLsm[2]=3; cfaToLsm[3]=2; break;
+        case mcc::CfaPattern::GBRG:
+            chMap[0]=1; chMap[1]=2; chMap[2]=0; chMap[3]=1;
+            cfaToLsm[0]=2; cfaToLsm[1]=3; cfaToLsm[2]=0; cfaToLsm[3]=1; break;
+    }
+
+    std::memcpy(C.cam_to_output, fullMatrix, sizeof(fullMatrix));
+    for (int i = 0; i < 4; ++i) {
+        C.black[i] = params.blackPerPosition[i];
+        const double denom = params.whiteLevel - double(params.blackPerPosition[i]);
+        C.inv_range[i] = denom > 0.0 ? float(1.0 / denom) : 0.0f;
+        C.cfa_channel[i] = chMap[i];
+        C.cfa_to_lsm[i]  = cfaToLsm[i];
+    }
+    C.curve  = curveCode;
+    C.width  = int(params.width);
+    C.height = int(params.height);
+    if (!params.lensShadingMap.empty() &&
+        params.lsmWidth >= 2 && params.lsmHeight >= 2) {
+        C.lsm_w    = int(params.lsmWidth);
+        C.lsm_h    = int(params.lsmHeight);
+        C.lsm_host = params.lensShadingMap.data();
+    } else {
+        C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr;
+    }
+    return true;
+}
+#endif  // MCRAW_HAVE_CUDA
+
 bool EndsWithExt(const std::string& s, const std::string& ext) {
     if (s.size() < ext.size()) return false;
     auto tail = s.substr(s.size() - ext.size());
@@ -143,7 +272,8 @@ public:
     // packed bytes, height, width). Lets callers (e.g. PyInstaller bundles that
     // don't ship numpy) build a QImage directly without importing numpy.
     py::tuple process_frame_rgb24(int64_t timestamp, const std::string& colorspace,
-                                  bool highlight_recovery, bool bake_vignette) {
+                                  bool highlight_recovery, bool bake_vignette,
+                                  bool prefer_gpu, int preview_bin) {
         mcc::OutputColorSpace cs;
         if (!mcc::ParseOutputColorSpace(colorspace, cs))
             throw std::runtime_error("unknown color space: " + colorspace);
@@ -151,33 +281,70 @@ public:
         std::vector<uint8_t> rawBuf;
         nlohmann::json frameMeta;
         std::vector<float> rgbOut;
+        std::vector<uint16_t> binnedBayer;
         uint32_t width = 0, height = 0;
         std::string outBytes;
         {
             py::gil_scoped_release release;
             d_->loadFrame(timestamp, rawBuf, frameMeta);
             auto params = mcc::BuildFrameParams(frameMeta, d_->getContainerMetadata());
+            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
+
+            // Preview proxy: decimate the Bayer to 1/bin resolution BEFORE the
+            // debayer/colour chain so a weak (CPU) machine can keep up in the
+            // real-time player. bin == 1 keeps full resolution; both the CPU
+            // and GPU paths below read params.width/height, so this transparently
+            // shrinks the per-pixel work on whichever backend runs.
+            if (preview_bin > 1) {
+                uint32_t bw = 0, bh = 0;
+                SubsampleBayerCells(raw, params.width, params.height, preview_bin,
+                                    binnedBayer, bw, bh);
+                if (!binnedBayer.empty()) {
+                    raw = binnedBayer.data();
+                    params.width = bw;
+                    params.height = bh;
+                }
+            }
             width = params.width;
             height = params.height;
-            const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
-            mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery, bake_vignette);
-
-            EnsureXform(cs);
-            cachedXform_.Apply(rgbOut.data(), width, height);
-            if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
-                mcc::HighlightRolloff(rgbOut.data(), width, height);
-            }
-
-            // Float [0,1] -> uint8 [0,255], packed RGB888.
             outBytes.resize(size_t(width) * size_t(height) * 3);
-            uint8_t* dst = reinterpret_cast<uint8_t*>(outBytes.data());
-            const float* src = rgbOut.data();
-            const size_t n = rgbOut.size();
-            for (size_t i = 0; i < n; ++i) {
-                float v = src[i];
-                if (v < 0.0f) v = 0.0f;
-                else if (v > 1.0f) v = 1.0f;
-                dst[i] = uint8_t(v * 255.0f + 0.5f);
+
+            bool didGpu = false;
+#if MCRAW_HAVE_CUDA
+            // Real-time preview fast path: full bayer->output chain on the GPU,
+            // 8-bit readback. Only for baked targets (OCIO falls to CPU below).
+            if (prefer_gpu && motioncam::cuda::IsCudaAvailable()) {
+                motioncam::cuda::BayerPipelineConstants C{};
+                if (BuildBakedBayerConstants(params, cs, C)) {
+                    C.highlight_recovery = highlight_recovery ? 1 : 0;
+                    C.highlight_rolloff  =
+                        (highlight_recovery && mcc::IsDisplayEncoded(cs)) ? 1 : 0;
+                    if (!bake_vignette) { C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr; }
+                    didGpu = motioncam::cuda::ProcessBayerToRgb8(
+                        raw, params.asShotNeutral, C,
+                        reinterpret_cast<uint8_t*>(outBytes.data()));
+                }
+            }
+#else
+            (void)prefer_gpu;
+#endif
+            if (!didGpu) {
+                mcc::ProcessFrame(raw, params, cs, rgbOut, highlight_recovery, bake_vignette);
+                EnsureXform(cs);
+                cachedXform_.Apply(rgbOut.data(), width, height);
+                if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
+                    mcc::HighlightRolloff(rgbOut.data(), width, height);
+                }
+                // Float [0,1] -> uint8 [0,255], packed RGB888.
+                uint8_t* dst = reinterpret_cast<uint8_t*>(outBytes.data());
+                const float* src = rgbOut.data();
+                const size_t n = rgbOut.size();
+                for (size_t i = 0; i < n; ++i) {
+                    float v = src[i];
+                    if (v < 0.0f) v = 0.0f;
+                    else if (v > 1.0f) v = 1.0f;
+                    dst[i] = uint8_t(v * 255.0f + 0.5f);
+                }
             }
         }
 
@@ -202,6 +369,29 @@ public:
             off += c.second.size();
         }
         return arr;
+    }
+
+    // numpy-free sibling of load_audio: interleaved int16 PCM as raw bytes, all
+    // chunks concatenated in order (audio starts at frame 0). The bundled GUI
+    // excludes numpy, so it feeds these bytes straight into a QAudioSink. Pair
+    // with audio_sample_rate / audio_channels. Empty bytes if the clip is silent.
+    py::bytes load_audio_bytes() {
+        std::vector<mc::AudioChunk> chunks;
+        {
+            py::gil_scoped_release release;
+            d_->loadAudio(chunks);
+        }
+        size_t total = 0;
+        for (auto& c : chunks) total += c.second.size();
+        std::string out;
+        out.resize(total * sizeof(int16_t));
+        size_t off = 0;
+        for (auto& c : chunks) {
+            const size_t nbytes = c.second.size() * sizeof(int16_t);
+            std::memcpy(&out[off], c.second.data(), nbytes);
+            off += nbytes;
+        }
+        return py::bytes(out);
     }
 
     // Internal access for free-function bindings that need to call the
@@ -635,6 +825,9 @@ PYBIND11_MODULE(mcraw, m) {
              "Returns (uint16 numpy (H,W) bayer, frame metadata dict).")
         .def("load_audio", &PyDecoder::load_audio,
              "Returns int16 numpy (samples, channels), interleaved.")
+        .def("load_audio_bytes", &PyDecoder::load_audio_bytes,
+             "Interleaved int16 PCM as raw bytes (numpy-free), all chunks "
+             "concatenated. Pair with audio_sample_rate / audio_channels.")
         .def("process_frame", &PyDecoder::process_frame,
              py::arg("timestamp"), py::arg("colorspace") = "acescg",
              py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
@@ -642,7 +835,11 @@ PYBIND11_MODULE(mcraw, m) {
         .def("process_frame_rgb24", &PyDecoder::process_frame_rgb24,
              py::arg("timestamp"), py::arg("colorspace") = "srgb",
              py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
-             "Returns (RGB888 packed bytes, height, width). No numpy required.");
+             py::arg("prefer_gpu") = false, py::arg("preview_bin") = 1,
+             "Returns (RGB888 packed bytes, height, width). No numpy required. "
+             "prefer_gpu uses the CUDA bayer pipeline for baked targets (real-time preview). "
+             "preview_bin>1 decimates the Bayer to 1/bin resolution first (preview proxy, "
+             "~1/bin^2 the per-pixel cost) for low-end machines.");
 
     py::class_<PyOcio>(m, "OcioTransform")
         .def(py::init<const std::string&, const std::string&>(),
