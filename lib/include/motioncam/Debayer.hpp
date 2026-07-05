@@ -53,6 +53,19 @@ void DebayerBilinear(
     uint32_t height,
     CfaPattern pattern);
 
+// Tier 3a: Malvar-He-Cutler (ICASSP 2004) 5x5 linear demosaic. Same
+// signature as DebayerBilinear and the pipeline's default since v0.7 —
+// gradient-corrected interpolation cuts the zipper/fringing bilinear
+// shows on high-contrast edges, at ~2x the tap count. The CUDA kernel
+// (DebayerMalvarKernel) mirrors this arithmetic exactly; keep the two in
+// lockstep or the GPU-vs-CPU verify scripts will fail.
+void DebayerMalvar(
+    const float* bayer,
+    float* outRgbInterleaved,
+    uint32_t width,
+    uint32_t height,
+    CfaPattern pattern);
+
 // Apply a lens shading map (per-pixel multipliers) to a normalized float Bayer.
 // Layout follows Android CameraMetadata LENS_SHADING_MAP: lsmWidth * lsmHeight
 // grid points, each holding 4 floats in [R, Gr, Gb, B] order (regardless of

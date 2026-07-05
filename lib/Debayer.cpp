@@ -266,6 +266,78 @@ void ApplyLensShading(
     });
 }
 
+void DebayerMalvar(
+    const float* bayer,
+    float* rgb,
+    uint32_t width,
+    uint32_t height,
+    CfaPattern pattern)
+{
+    // Malvar-He-Cutler gradient-corrected linear demosaic (ICASSP 2004).
+    // Five 5x5 filters, all with a /8 normaliser:
+    //   G at R/B:            4C + 2(N,S,E,W) - (NN,SS,EE,WW)
+    //   R/B at same-row G:   5C + 4(E,W) - (corners, EE, WW) + 0.5(NN, SS)
+    //   R/B at same-col G:   5C + 4(N,S) - (corners, NN, SS) + 0.5(EE, WW)
+    //   R at B / B at R:     6C + 2(corners) - 1.5(NN, SS, EE, WW)
+    // Borders clamp like DebayerBilinear. The CUDA DebayerMalvarKernel is a
+    // tap-for-tap copy of this arithmetic — keep them in lockstep.
+    int ch[4];
+    CfaChannelMap(pattern, ch);
+
+    const int32_t w = int32_t(width);
+    const int32_t h = int32_t(height);
+
+    auto at = [&](int32_t x, int32_t y) -> float {
+        x = std::max(0, std::min(w - 1, x));
+        y = std::max(0, std::min(h - 1, y));
+        return bayer[size_t(y) * size_t(width) + size_t(x)];
+    };
+
+    motioncam::internal::ParallelForRange(size_t(h), [&](size_t y0, size_t y1) {
+        for (int32_t y = int32_t(y0); y < int32_t(y1); ++y) {
+            for (int32_t x = 0; x < w; ++x) {
+                const int idx = ((y & 1) << 1) | (x & 1);
+                const int c = ch[idx];
+                const float C = bayer[size_t(y) * size_t(width) + size_t(x)];
+
+                // Shared cross taps.
+                const float axmm = at(x-2, y), axpp = at(x+2, y);
+                const float aymm = at(x, y-2), aypp = at(x, y+2);
+                float r, g, b;
+
+                if (c == 0 || c == 2) {
+                    const float cross  = at(x-1,y) + at(x+1,y) + at(x,y-1) + at(x,y+1);
+                    const float diag   = at(x-1,y-1) + at(x+1,y-1) + at(x-1,y+1) + at(x+1,y+1);
+                    const float axial  = axmm + axpp + aymm + aypp;
+                    const float gv = (4.0f * C + 2.0f * cross - axial) * 0.125f;
+                    const float ov = (6.0f * C + 2.0f * diag - 1.5f * axial) * 0.125f;
+                    g = gv;
+                    if (c == 0) { r = C;  b = ov; }
+                    else        { b = C;  r = ov; }
+                }
+                else {
+                    g = C;
+                    const float corners = at(x-1,y-1) + at(x+1,y-1) + at(x-1,y+1) + at(x+1,y+1);
+                    const float hv = (5.0f * C + 4.0f * (at(x-1,y) + at(x+1,y))
+                                      - (corners + axmm + axpp)
+                                      + 0.5f * (aymm + aypp)) * 0.125f;
+                    const float vv = (5.0f * C + 4.0f * (at(x,y-1) + at(x,y+1))
+                                      - (corners + aymm + aypp)
+                                      + 0.5f * (axmm + axpp)) * 0.125f;
+                    const int hIdx = ((y & 1) << 1) | ((x + 1) & 1);
+                    if (ch[hIdx] == 0) { r = hv; b = vv; }
+                    else               { b = hv; r = vv; }
+                }
+
+                const size_t o = (size_t(y) * size_t(width) + size_t(x)) * 3;
+                rgb[o + 0] = r;
+                rgb[o + 1] = g;
+                rgb[o + 2] = b;
+            }
+        }
+    });
+}
+
 void DebayerBilinear(
     const float* bayer,
     float* rgb,

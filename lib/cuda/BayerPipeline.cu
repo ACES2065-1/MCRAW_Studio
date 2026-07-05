@@ -407,6 +407,90 @@ __global__ void DebayerBilinearKernel(
 }
 
 // ============================================================================
+// Kernel 2b (Tier 3a): DebayerMalvar  -  Malvar-He-Cutler 5x5 demosaic
+// (tap-for-tap copy of Debayer.cpp::DebayerMalvar — keep in lockstep).
+// The pipeline default since v0.7; DebayerBilinearKernel stays for reference.
+// ============================================================================
+
+__global__ void DebayerMalvarKernel(
+    const float* __restrict__ bayer,
+    float* __restrict__ rgb,            // width*height*3 interleaved
+    int width, int height,
+    int ch0, int ch1, int ch2, int ch3)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+
+    const int idx = ((y & 1) << 1) | (x & 1);
+    int c;
+    switch (idx) {
+        case 0:  c = ch0; break;
+        case 1:  c = ch1; break;
+        case 2:  c = ch2; break;
+        default: c = ch3; break;
+    }
+
+    const float C = bayer[size_t(y) * size_t(width) + size_t(x)];
+
+    // Shared cross taps (clamped like the CPU version).
+    const float axmm = SampleClamped(bayer, x-2, y, width, height);
+    const float axpp = SampleClamped(bayer, x+2, y, width, height);
+    const float aymm = SampleClamped(bayer, x, y-2, width, height);
+    const float aypp = SampleClamped(bayer, x, y+2, width, height);
+    float r, g, b;
+
+    if (c == 0 || c == 2) {
+        const float cross = SampleClamped(bayer, x-1, y,   width, height)
+                          + SampleClamped(bayer, x+1, y,   width, height)
+                          + SampleClamped(bayer, x,   y-1, width, height)
+                          + SampleClamped(bayer, x,   y+1, width, height);
+        const float diag  = SampleClamped(bayer, x-1, y-1, width, height)
+                          + SampleClamped(bayer, x+1, y-1, width, height)
+                          + SampleClamped(bayer, x-1, y+1, width, height)
+                          + SampleClamped(bayer, x+1, y+1, width, height);
+        const float axial = axmm + axpp + aymm + aypp;
+        const float gv = (4.0f * C + 2.0f * cross - axial) * 0.125f;
+        const float ov = (6.0f * C + 2.0f * diag - 1.5f * axial) * 0.125f;
+        g = gv;
+        if (c == 0) { r = C;  b = ov; }
+        else        { b = C;  r = ov; }
+    }
+    else {
+        g = C;
+        const float corners = SampleClamped(bayer, x-1, y-1, width, height)
+                            + SampleClamped(bayer, x+1, y-1, width, height)
+                            + SampleClamped(bayer, x-1, y+1, width, height)
+                            + SampleClamped(bayer, x+1, y+1, width, height);
+        const float hv = (5.0f * C
+                          + 4.0f * (SampleClamped(bayer, x-1, y, width, height)
+                                    + SampleClamped(bayer, x+1, y, width, height))
+                          - (corners + axmm + axpp)
+                          + 0.5f * (aymm + aypp)) * 0.125f;
+        const float vv = (5.0f * C
+                          + 4.0f * (SampleClamped(bayer, x, y-1, width, height)
+                                    + SampleClamped(bayer, x, y+1, width, height))
+                          - (corners + aymm + aypp)
+                          + 0.5f * (axmm + axpp)) * 0.125f;
+        const int h_idx = ((y & 1) << 1) | ((x + 1) & 1);
+        int h_c;
+        switch (h_idx) {
+            case 0:  h_c = ch0; break;
+            case 1:  h_c = ch1; break;
+            case 2:  h_c = ch2; break;
+            default: h_c = ch3; break;
+        }
+        if (h_c == 0) { r = hv; b = vv; }
+        else          { b = hv; r = vv; }
+    }
+
+    const size_t o = (size_t(y) * size_t(width) + size_t(x)) * 3;
+    rgb[o + 0] = r;
+    rgb[o + 1] = g;
+    rgb[o + 2] = b;
+}
+
+// ============================================================================
 // Kernel 3: ApplyMatrixCurve  -  in-place 3x3 matrix mul + optional curve
 // (matches BakedTransform.cpp::ApplyBakedTransform; same math)
 // ============================================================================
@@ -910,7 +994,8 @@ bool RunBayerChainLocked(PipelineCtx& ctx, const uint16_t* bayer_host,
         if (cudaGetLastError() != cudaSuccess) return false;
     }
 
-    DebayerBilinearKernel<<<grid, block, 0, s>>>(
+    // Tier 3a: Malvar-He-Cutler demosaic (matches the CPU pipeline default).
+    DebayerMalvarKernel<<<grid, block, 0, s>>>(
         ctx.bayerFloat, ctx.rgbFloat, W, H,
         C.cfa_channel[0], C.cfa_channel[1],
         C.cfa_channel[2], C.cfa_channel[3]);

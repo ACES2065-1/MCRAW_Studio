@@ -228,7 +228,9 @@ void ProcessFrame(
 
     outRgb.resize(numPixels * 3);
 
-    DebayerBilinear(
+    // Tier 3a: Malvar-He-Cutler replaces bilinear as the pipeline default —
+    // same layout, better edges (less zipper/fringing on high contrast).
+    DebayerMalvar(
         bayerFloat.data(), outRgb.data(),
         params.width, params.height,
         params.cfa);
