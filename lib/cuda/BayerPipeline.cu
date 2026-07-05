@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -31,25 +32,61 @@ namespace motioncam {
 namespace cuda {
 
 // ============================================================================
-// Persistent device buffers (one set per process; resized on first use,
-// freed via ReleaseBayerPipeline()).
+// Persistent device buffers — Phase G: one full set per *context*.
+//
+// Two contexts exist:
+//   gRenderCtx  — the batch NVENC render path (ProcessBayerToRgb / Nv12 /
+//                 P010). Runs on the legacy default stream, exactly as the
+//                 pre-Phase-G code did, so the NV12/P010 converters and
+//                 their cudaDeviceSynchronize keep their ordering.
+//   gPreviewCtx — the real-time player (ProcessBayerToRgb8). Has its OWN
+//                 mutex, buffer set, pinned host staging, and a
+//                 non-blocking CUDA stream, so a 4K render and a proxy-res
+//                 preview no longer serialize on one lock, thrash each
+//                 other's buffer allocations, or stall each other with
+//                 device-wide syncs.
 // ============================================================================
 
 namespace {
 
-uint16_t*    gBayerU16   = nullptr;   // width*height  u16
-float*       gBayerFloat = nullptr;   // width*height  float
-float*       gRgbFloat   = nullptr;   // width*height*3 float
-uint8_t*     gRgb8       = nullptr;   // width*height*3 u8 (preview readback)
-size_t       gRgb8Bytes  = 0;
-int          gBufW       = 0;
-int          gBufH       = 0;
-// LSM scratch: re-allocated when grid dimensions change. Tiny (a few KB
-// for typical 17x13 or 65x49 grids x 4 channels) so we just realloc.
-float*       gLsmDevice  = nullptr;
-int          gLsmW       = 0;
-int          gLsmH       = 0;
-std::mutex   gBufMutex;
+struct PipelineCtx {
+    uint16_t* bayerU16   = nullptr;   // width*height  u16
+    float*    bayerFloat = nullptr;   // width*height  float
+    float*    rgbFloat   = nullptr;   // width*height*3 float
+    uint8_t*  rgb8       = nullptr;   // width*height*3 u8 (preview readback)
+    size_t    rgb8Bytes  = 0;
+    int       bufW       = 0;
+    int       bufH       = 0;
+    // LSM scratch: re-allocated when grid dimensions change. Tiny (a few KB
+    // for typical 17x13 or 65x49 grids x 4 channels) so we just realloc.
+    float*    lsmDevice  = nullptr;
+    int       lsmW       = 0;
+    int       lsmH       = 0;
+    // Phase F denoise scratch (render ctx only in practice).
+    float*    dnY        = nullptr;
+    float*    dnCb       = nullptr;
+    float*    dnCr       = nullptr;
+    float*    dnTmp      = nullptr;
+    float*    dnWeights  = nullptr;   // up to 65 Gaussian taps
+    size_t    dnN        = 0;
+    // Pinned host staging (preview ctx only): upload bounce + readback
+    // target. Pinned pages DMA at full PCIe rate and make the async
+    // copies on `stream` genuinely asynchronous.
+    uint16_t* pinnedBayer      = nullptr;
+    size_t    pinnedBayerBytes = 0;
+    uint8_t*  pinnedRgb8       = nullptr;
+    size_t    pinnedRgb8Bytes  = 0;
+    bool      usePinned        = false;
+    // 0 = legacy default stream (render). The preview ctx lazily creates a
+    // cudaStreamNonBlocking stream so it never implicitly syncs with the
+    // render's default-stream work.
+    cudaStream_t stream        = 0;
+    bool         streamCreated = false;
+    std::mutex   mtx;
+};
+
+PipelineCtx gRenderCtx;
+PipelineCtx gPreviewCtx;
 
 // Phase D: OCIO 3D LUT, uploaded once per clip via SetupLut3D(). Stored as a
 // float4 cudaArray sampled with hardware trilinear filtering. The B axis is
@@ -67,89 +104,127 @@ void ReleaseLut3DLocked() {
     gLutValid = false;
 }
 
-// Phase F: denoise scratch (output-space Y/Cb/Cr planes + one shared tmp, plus
-// a tiny device buffer for the separable Gaussian weights). Allocated lazily
-// when a denoise render first runs; sized to width*height.
-float*  gDnY       = nullptr;
-float*  gDnCb      = nullptr;
-float*  gDnCr      = nullptr;
-float*  gDnTmp     = nullptr;
-float*  gDnWeights = nullptr;       // up to 65 Gaussian taps
-size_t  gDnN       = 0;
 constexpr int kDnMaxRadius = 32;    // matches Denoise.cpp's cap
 
-void ReleaseDenoiseLocked() {
-    if (gDnY)       { cudaFree(gDnY);       gDnY = nullptr; }
-    if (gDnCb)      { cudaFree(gDnCb);      gDnCb = nullptr; }
-    if (gDnCr)      { cudaFree(gDnCr);      gDnCr = nullptr; }
-    if (gDnTmp)     { cudaFree(gDnTmp);     gDnTmp = nullptr; }
-    if (gDnWeights) { cudaFree(gDnWeights); gDnWeights = nullptr; }
-    gDnN = 0;
+void ReleaseDenoiseLocked(PipelineCtx& ctx) {
+    if (ctx.dnY)       { cudaFree(ctx.dnY);       ctx.dnY = nullptr; }
+    if (ctx.dnCb)      { cudaFree(ctx.dnCb);      ctx.dnCb = nullptr; }
+    if (ctx.dnCr)      { cudaFree(ctx.dnCr);      ctx.dnCr = nullptr; }
+    if (ctx.dnTmp)     { cudaFree(ctx.dnTmp);     ctx.dnTmp = nullptr; }
+    if (ctx.dnWeights) { cudaFree(ctx.dnWeights); ctx.dnWeights = nullptr; }
+    ctx.dnN = 0;
 }
 
-bool EnsureDenoiseBuffers(size_t n) {
-    if (n == gDnN && gDnY && gDnCb && gDnCr && gDnTmp && gDnWeights) return true;
-    ReleaseDenoiseLocked();
+bool EnsureDenoiseBuffers(PipelineCtx& ctx, size_t n) {
+    if (n == ctx.dnN && ctx.dnY && ctx.dnCb && ctx.dnCr && ctx.dnTmp &&
+        ctx.dnWeights) return true;
+    ReleaseDenoiseLocked(ctx);
     const size_t bytes = n * sizeof(float);
-    cudaError_t e1 = cudaMalloc(reinterpret_cast<void**>(&gDnY),   bytes);
-    cudaError_t e2 = cudaMalloc(reinterpret_cast<void**>(&gDnCb),  bytes);
-    cudaError_t e3 = cudaMalloc(reinterpret_cast<void**>(&gDnCr),  bytes);
-    cudaError_t e4 = cudaMalloc(reinterpret_cast<void**>(&gDnTmp), bytes);
-    cudaError_t e5 = cudaMalloc(reinterpret_cast<void**>(&gDnWeights),
+    cudaError_t e1 = cudaMalloc(reinterpret_cast<void**>(&ctx.dnY),   bytes);
+    cudaError_t e2 = cudaMalloc(reinterpret_cast<void**>(&ctx.dnCb),  bytes);
+    cudaError_t e3 = cudaMalloc(reinterpret_cast<void**>(&ctx.dnCr),  bytes);
+    cudaError_t e4 = cudaMalloc(reinterpret_cast<void**>(&ctx.dnTmp), bytes);
+    cudaError_t e5 = cudaMalloc(reinterpret_cast<void**>(&ctx.dnWeights),
                                 size_t(kDnMaxRadius * 2 + 1) * sizeof(float));
-    if (e1 || e2 || e3 || e4 || e5) { ReleaseDenoiseLocked(); return false; }
-    gDnN = n;
+    if (e1 || e2 || e3 || e4 || e5) { ReleaseDenoiseLocked(ctx); return false; }
+    ctx.dnN = n;
     return true;
 }
 
-bool EnsureBuffers(int width, int height) {
-    if (width == gBufW && height == gBufH &&
-        gBayerU16 && gBayerFloat && gRgbFloat) {
+bool EnsureBuffers(PipelineCtx& ctx, int width, int height) {
+    if (width == ctx.bufW && height == ctx.bufH &&
+        ctx.bayerU16 && ctx.bayerFloat && ctx.rgbFloat) {
         return true;
     }
 
     // Resize or first-allocate. Free old buffers if dimensions changed.
-    if (gBayerU16)   { cudaFree(gBayerU16);   gBayerU16   = nullptr; }
-    if (gBayerFloat) { cudaFree(gBayerFloat); gBayerFloat = nullptr; }
-    if (gRgbFloat)   { cudaFree(gRgbFloat);   gRgbFloat   = nullptr; }
-    gBufW = 0;
-    gBufH = 0;
+    if (ctx.bayerU16)   { cudaFree(ctx.bayerU16);   ctx.bayerU16   = nullptr; }
+    if (ctx.bayerFloat) { cudaFree(ctx.bayerFloat); ctx.bayerFloat = nullptr; }
+    if (ctx.rgbFloat)   { cudaFree(ctx.rgbFloat);   ctx.rgbFloat   = nullptr; }
+    ctx.bufW = 0;
+    ctx.bufH = 0;
 
     const size_t n = size_t(width) * size_t(height);
-    cudaError_t e1 = cudaMalloc(reinterpret_cast<void**>(&gBayerU16),   n * sizeof(uint16_t));
-    cudaError_t e2 = cudaMalloc(reinterpret_cast<void**>(&gBayerFloat), n * sizeof(float));
-    cudaError_t e3 = cudaMalloc(reinterpret_cast<void**>(&gRgbFloat),   n * 3 * sizeof(float));
+    cudaError_t e1 = cudaMalloc(reinterpret_cast<void**>(&ctx.bayerU16),   n * sizeof(uint16_t));
+    cudaError_t e2 = cudaMalloc(reinterpret_cast<void**>(&ctx.bayerFloat), n * sizeof(float));
+    cudaError_t e3 = cudaMalloc(reinterpret_cast<void**>(&ctx.rgbFloat),   n * 3 * sizeof(float));
     if (e1 != cudaSuccess || e2 != cudaSuccess || e3 != cudaSuccess) {
-        if (gBayerU16)   { cudaFree(gBayerU16);   gBayerU16   = nullptr; }
-        if (gBayerFloat) { cudaFree(gBayerFloat); gBayerFloat = nullptr; }
-        if (gRgbFloat)   { cudaFree(gRgbFloat);   gRgbFloat   = nullptr; }
+        if (ctx.bayerU16)   { cudaFree(ctx.bayerU16);   ctx.bayerU16   = nullptr; }
+        if (ctx.bayerFloat) { cudaFree(ctx.bayerFloat); ctx.bayerFloat = nullptr; }
+        if (ctx.rgbFloat)   { cudaFree(ctx.rgbFloat);   ctx.rgbFloat   = nullptr; }
         return false;
     }
-    gBufW = width;
-    gBufH = height;
+    ctx.bufW = width;
+    ctx.bufH = height;
     return true;
+}
+
+// Preview ctx: lazily create the non-blocking stream and size the pinned
+// host staging buffers. Caller holds ctx.mtx.
+bool EnsurePreviewTransport(PipelineCtx& ctx, size_t bayerBytes, size_t rgb8Bytes) {
+    if (!ctx.streamCreated) {
+        if (cudaStreamCreateWithFlags(&ctx.stream, cudaStreamNonBlocking)
+                != cudaSuccess) {
+            ctx.stream = 0;   // degrade to the default stream, still correct
+        }
+        ctx.streamCreated = true;
+    }
+    if (ctx.pinnedBayerBytes != bayerBytes || !ctx.pinnedBayer) {
+        if (ctx.pinnedBayer) { cudaFreeHost(ctx.pinnedBayer); ctx.pinnedBayer = nullptr; }
+        ctx.pinnedBayerBytes = 0;
+        if (cudaMallocHost(reinterpret_cast<void**>(&ctx.pinnedBayer),
+                           bayerBytes) != cudaSuccess) {
+            ctx.pinnedBayer = nullptr;
+        } else {
+            ctx.pinnedBayerBytes = bayerBytes;
+        }
+    }
+    if (ctx.pinnedRgb8Bytes != rgb8Bytes || !ctx.pinnedRgb8) {
+        if (ctx.pinnedRgb8) { cudaFreeHost(ctx.pinnedRgb8); ctx.pinnedRgb8 = nullptr; }
+        ctx.pinnedRgb8Bytes = 0;
+        if (cudaMallocHost(reinterpret_cast<void**>(&ctx.pinnedRgb8),
+                           rgb8Bytes) != cudaSuccess) {
+            ctx.pinnedRgb8 = nullptr;
+        } else {
+            ctx.pinnedRgb8Bytes = rgb8Bytes;
+        }
+    }
+    // Pinned staging is an optimisation, not a correctness requirement —
+    // if either alloc failed we fall back to pageable copies.
+    ctx.usePinned = (ctx.pinnedBayer != nullptr);
+    return true;
+}
+
+void ReleaseCtxLocked(PipelineCtx& ctx) {
+    if (ctx.bayerU16)    { cudaFree(ctx.bayerU16);        ctx.bayerU16    = nullptr; }
+    if (ctx.bayerFloat)  { cudaFree(ctx.bayerFloat);      ctx.bayerFloat  = nullptr; }
+    if (ctx.rgbFloat)    { cudaFree(ctx.rgbFloat);        ctx.rgbFloat    = nullptr; }
+    if (ctx.rgb8)        { cudaFree(ctx.rgb8);            ctx.rgb8        = nullptr; ctx.rgb8Bytes = 0; }
+    if (ctx.lsmDevice)   { cudaFree(ctx.lsmDevice);       ctx.lsmDevice   = nullptr; }
+    if (ctx.pinnedBayer) { cudaFreeHost(ctx.pinnedBayer); ctx.pinnedBayer = nullptr; ctx.pinnedBayerBytes = 0; }
+    if (ctx.pinnedRgb8)  { cudaFreeHost(ctx.pinnedRgb8);  ctx.pinnedRgb8  = nullptr; ctx.pinnedRgb8Bytes = 0; }
+    ReleaseDenoiseLocked(ctx);
+    ctx.bufW = 0;
+    ctx.bufH = 0;
+    ctx.lsmW = 0;
+    ctx.lsmH = 0;
 }
 
 }  // namespace
 
 bool SetupBayerPipeline(int width, int height) {
     if (!IsCudaAvailable() || width <= 0 || height <= 0) return false;
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    return EnsureBuffers(width, height);
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
+    return EnsureBuffers(gRenderCtx, width, height);
 }
 
 void ReleaseBayerPipeline() {
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (gBayerU16)   { cudaFree(gBayerU16);   gBayerU16   = nullptr; }
-    if (gBayerFloat) { cudaFree(gBayerFloat); gBayerFloat = nullptr; }
-    if (gRgbFloat)   { cudaFree(gRgbFloat);   gRgbFloat   = nullptr; }
-    if (gRgb8)       { cudaFree(gRgb8);        gRgb8       = nullptr; gRgb8Bytes = 0; }
-    if (gLsmDevice)  { cudaFree(gLsmDevice);  gLsmDevice  = nullptr; }
-    ReleaseDenoiseLocked();
-    gBufW = 0;
-    gBufH = 0;
-    gLsmW = 0;
-    gLsmH = 0;
+    // Encoder teardown releases only the RENDER context. The preview
+    // context belongs to the GUI player and survives renders finishing —
+    // pre-Phase-G this call would yank the shared buffers out from under
+    // a live preview and force a realloc on its next frame.
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
+    ReleaseCtxLocked(gRenderCtx);
 }
 
 // ============================================================================
@@ -157,8 +232,10 @@ void ReleaseBayerPipeline() {
 // ============================================================================
 
 bool SetupLut3D(const float* lut_rgba_host, int n) {
+    // The 3D LUT is a render-path feature (OCIO targets); the preview only
+    // runs baked targets, so the LUT globals live under the render lock.
     if (!IsCudaAvailable() || !lut_rgba_host || n < 2) return false;
-    std::lock_guard<std::mutex> lock(gBufMutex);
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
 
     ReleaseLut3DLocked();
 
@@ -200,12 +277,12 @@ bool SetupLut3D(const float* lut_rgba_host, int n) {
 }
 
 bool HasLut3D() {
-    std::lock_guard<std::mutex> lock(gBufMutex);
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
     return gLutValid;
 }
 
 void ReleaseLut3D() {
-    std::lock_guard<std::mutex> lock(gBufMutex);
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
     ReleaseLut3DLocked();
 }
 
@@ -677,18 +754,20 @@ __global__ void ApplyLensShadingKernel(
 // ============================================================================
 
 // Phase D: optional ACEScg->target 3D LUT after the matrix. Caller must hold
-// gBufMutex and have just left ACEScg in gRgbFloat. Returns false only on a
+// ctx.mtx and have just left ACEScg in ctx.rgbFloat. Returns false only on a
 // kernel launch error; a no-op (LUT disabled / not loaded) returns true.
+// Only the render ctx ever sets use_lut3d, so the LUT globals stay safely
+// under the render lock.
 namespace {
-bool MaybeApplyLut3D(const BayerPipelineConstants& C, int W, int H,
-                     dim3 grid, dim3 block) {
+bool MaybeApplyLut3D(PipelineCtx& ctx, const BayerPipelineConstants& C,
+                     int W, int H, dim3 grid, dim3 block) {
     if (!C.use_lut3d || !gLutValid) return true;
     const float K       = kLutShaperK;
     const float sLo     = std::asinh(kLutShaperLo / K);
     const float sHi     = std::asinh(kLutShaperHi / K);
     const float invSpan = 1.0f / (sHi - sLo);
-    ApplyLut3DKernel<<<grid, block>>>(gRgbFloat, W, H, gLutTex, gLutN,
-                                      K, sLo, invSpan);
+    ApplyLut3DKernel<<<grid, block, 0, ctx.stream>>>(
+        ctx.rgbFloat, W, H, gLutTex, gLutN, K, sLo, invSpan);
     return cudaGetLastError() == cudaSuccess;
 }
 
@@ -712,20 +791,22 @@ std::vector<float> BuildGaussianKernel(float sigma, int& radius) {
     return k;
 }
 
-// Phase F: output-space denoise on gRgbFloat. Caller holds gBufMutex and has
-// left output-space RGB in gRgbFloat (after matrix/LUT/rolloff). No-op when
+// Phase F: output-space denoise on ctx.rgbFloat. Caller holds ctx.mtx and has
+// left output-space RGB in ctx.rgbFloat (after matrix/LUT/rolloff). No-op when
 // both strengths are 0. Returns false on any launch/alloc error.
-bool RunDenoiseLocked(const BayerPipelineConstants& C, int W, int H,
-                      dim3 grid, dim3 block) {
+bool RunDenoiseLocked(PipelineCtx& ctx, const BayerPipelineConstants& C,
+                      int W, int H, dim3 grid, dim3 block) {
     int chroma = C.denoise_chroma, luma = C.denoise_luma;
     if (chroma <= 0 && luma <= 0) return true;
     if (chroma < 0) chroma = 0; else if (chroma > 100) chroma = 100;
     if (luma   < 0) luma   = 0; else if (luma   > 100) luma   = 100;
     if (W < 3 || H < 3) return true;
 
-    if (!EnsureDenoiseBuffers(size_t(W) * size_t(H))) return false;
+    if (!EnsureDenoiseBuffers(ctx, size_t(W) * size_t(H))) return false;
+    const cudaStream_t s = ctx.stream;
 
-    SplitYCbCrKernel<<<grid, block>>>(gRgbFloat, gDnY, gDnCb, gDnCr, W, H);
+    SplitYCbCrKernel<<<grid, block, 0, s>>>(ctx.rgbFloat, ctx.dnY, ctx.dnCb,
+                                            ctx.dnCr, W, H);
     if (cudaGetLastError() != cudaSuccess) return false;
 
     if (chroma > 0) {
@@ -733,48 +814,59 @@ bool RunDenoiseLocked(const BayerPipelineConstants& C, int W, int H,
         int radius = 0;
         std::vector<float> k = BuildGaussianKernel(sigma, radius);
         if (radius > 0) {
-            if (cudaMemcpyAsync(gDnWeights, k.data(), k.size() * sizeof(float),
-                                cudaMemcpyHostToDevice, 0) != cudaSuccess)
+            if (cudaMemcpyAsync(ctx.dnWeights, k.data(), k.size() * sizeof(float),
+                                cudaMemcpyHostToDevice, s) != cudaSuccess)
                 return false;
             // Cb: H -> tmp, V -> Cb.  Cr: H -> tmp, V -> Cr.
-            GaussianBlurAxisKernel<<<grid, block>>>(gDnCb, gDnTmp, W, H, gDnWeights, radius, 1);
-            GaussianBlurAxisKernel<<<grid, block>>>(gDnTmp, gDnCb, W, H, gDnWeights, radius, 0);
-            GaussianBlurAxisKernel<<<grid, block>>>(gDnCr, gDnTmp, W, H, gDnWeights, radius, 1);
-            GaussianBlurAxisKernel<<<grid, block>>>(gDnTmp, gDnCr, W, H, gDnWeights, radius, 0);
+            GaussianBlurAxisKernel<<<grid, block, 0, s>>>(ctx.dnCb, ctx.dnTmp, W, H, ctx.dnWeights, radius, 1);
+            GaussianBlurAxisKernel<<<grid, block, 0, s>>>(ctx.dnTmp, ctx.dnCb, W, H, ctx.dnWeights, radius, 0);
+            GaussianBlurAxisKernel<<<grid, block, 0, s>>>(ctx.dnCr, ctx.dnTmp, W, H, ctx.dnWeights, radius, 1);
+            GaussianBlurAxisKernel<<<grid, block, 0, s>>>(ctx.dnTmp, ctx.dnCr, W, H, ctx.dnWeights, radius, 0);
             if (cudaGetLastError() != cudaSuccess) return false;
         }
     }
 
-    const float* Yptr = gDnY;
+    const float* Yptr = ctx.dnY;
     if (luma > 0) {
         const float ssig = float(luma) * 0.025f;
         const float rsig = 0.005f + float(luma) * 0.0005f;
         if (ssig >= 0.05f) {  // matches Bilateral5x5's early-out (memcpy)
             const float invSp2 = 1.0f / (2.0f * ssig * ssig);
             const float invRn2 = 1.0f / (2.0f * rsig * rsig);
-            Bilateral5x5Kernel<<<grid, block>>>(gDnY, gDnTmp, W, H, invSp2, invRn2);
+            Bilateral5x5Kernel<<<grid, block, 0, s>>>(ctx.dnY, ctx.dnTmp, W, H, invSp2, invRn2);
             if (cudaGetLastError() != cudaSuccess) return false;
-            Yptr = gDnTmp;  // denoised luma now in tmp
+            Yptr = ctx.dnTmp;  // denoised luma now in tmp
         }
     }
 
-    CombineYCbCrKernel<<<grid, block>>>(gRgbFloat, Yptr, gDnCb, gDnCr, W, H);
+    CombineYCbCrKernel<<<grid, block, 0, s>>>(ctx.rgbFloat, Yptr, ctx.dnCb,
+                                              ctx.dnCr, W, H);
     return cudaGetLastError() == cudaSuccess;
 }
 }  // namespace
 
 // Shared bayer->ACEScg/target chain: upload -> normalise -> (LSM) -> debayer
-// -> matrix(+curve) -> (3D LUT). Leaves the result in gRgbFloat. Caller must
-// hold gBufMutex. Does NOT synchronise — the tail step (host copy / NV12 /
+// -> matrix(+curve) -> (3D LUT). Leaves the result in ctx.rgbFloat. Caller
+// must hold ctx.mtx. Does NOT synchronise — the tail step (host copy / NV12 /
 // P010) handles that. Returns false on any launch/copy error.
 namespace {
-bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
+bool RunBayerChainLocked(PipelineCtx& ctx, const uint16_t* bayer_host,
+                         const float wb[3],
                          const BayerPipelineConstants& C, int W, int H) {
     const size_t n = size_t(W) * size_t(H);
+    const cudaStream_t s = ctx.stream;
 
+    // Upload. The preview ctx bounces through pinned host memory so the
+    // async copy DMAs at full rate and genuinely overlaps on its stream;
+    // the render ctx keeps the original direct (pageable) copy.
+    const void* src = bayer_host;
+    if (ctx.usePinned && ctx.pinnedBayerBytes >= n * sizeof(uint16_t)) {
+        std::memcpy(ctx.pinnedBayer, bayer_host, n * sizeof(uint16_t));
+        src = ctx.pinnedBayer;
+    }
     cudaError_t err = cudaMemcpyAsync(
-        gBayerU16, bayer_host, n * sizeof(uint16_t),
-        cudaMemcpyHostToDevice, 0);
+        ctx.bayerU16, src, n * sizeof(uint16_t),
+        cudaMemcpyHostToDevice, s);
     if (err != cudaSuccess) return false;
 
     // Fold dynamic-range normalise + WB multiply into one scale per CFA
@@ -790,8 +882,8 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
     dim3 block(32, 8);
     dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
 
-    NormalizeBayerKernel<<<grid, block>>>(
-        gBayerU16, gBayerFloat, W, H,
+    NormalizeBayerKernel<<<grid, block, 0, s>>>(
+        ctx.bayerU16, ctx.bayerFloat, W, H,
         blacks[0], blacks[1], blacks[2], blacks[3],
         scales[0], scales[1], scales[2], scales[3]);
     if (cudaGetLastError() != cudaSuccess) return false;
@@ -799,40 +891,40 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
     // Optional lens shading map (uploaded each call - tiny).
     if (C.lsm_w >= 2 && C.lsm_h >= 2 && C.lsm_host) {
         const size_t lsmBytes = size_t(C.lsm_w) * size_t(C.lsm_h) * 4 * sizeof(float);
-        if (C.lsm_w != gLsmW || C.lsm_h != gLsmH || gLsmDevice == nullptr) {
-            if (gLsmDevice) { cudaFree(gLsmDevice); gLsmDevice = nullptr; }
-            if (cudaMalloc(reinterpret_cast<void**>(&gLsmDevice), lsmBytes) != cudaSuccess)
+        if (C.lsm_w != ctx.lsmW || C.lsm_h != ctx.lsmH || ctx.lsmDevice == nullptr) {
+            if (ctx.lsmDevice) { cudaFree(ctx.lsmDevice); ctx.lsmDevice = nullptr; }
+            if (cudaMalloc(reinterpret_cast<void**>(&ctx.lsmDevice), lsmBytes) != cudaSuccess)
                 return false;
-            gLsmW = C.lsm_w;
-            gLsmH = C.lsm_h;
+            ctx.lsmW = C.lsm_w;
+            ctx.lsmH = C.lsm_h;
         }
-        if (cudaMemcpyAsync(gLsmDevice, C.lsm_host, lsmBytes,
-                            cudaMemcpyHostToDevice, 0) != cudaSuccess)
+        if (cudaMemcpyAsync(ctx.lsmDevice, C.lsm_host, lsmBytes,
+                            cudaMemcpyHostToDevice, s) != cudaSuccess)
             return false;
 
-        ApplyLensShadingKernel<<<grid, block>>>(
-            gBayerFloat, W, H,
-            gLsmDevice, C.lsm_w, C.lsm_h,
+        ApplyLensShadingKernel<<<grid, block, 0, s>>>(
+            ctx.bayerFloat, W, H,
+            ctx.lsmDevice, C.lsm_w, C.lsm_h,
             C.cfa_to_lsm[0], C.cfa_to_lsm[1],
             C.cfa_to_lsm[2], C.cfa_to_lsm[3]);
         if (cudaGetLastError() != cudaSuccess) return false;
     }
 
-    DebayerBilinearKernel<<<grid, block>>>(
-        gBayerFloat, gRgbFloat, W, H,
+    DebayerBilinearKernel<<<grid, block, 0, s>>>(
+        ctx.bayerFloat, ctx.rgbFloat, W, H,
         C.cfa_channel[0], C.cfa_channel[1],
         C.cfa_channel[2], C.cfa_channel[3]);
     if (cudaGetLastError() != cudaSuccess) return false;
 
     // Phase E.3: pre-matrix highlight recovery (cam-RGB, WB-applied).
     if (C.highlight_recovery) {
-        NeutraliseClippedHighlightsKernel<<<grid, block>>>(
-            gRgbFloat, W, H, wb[0], wb[1], wb[2]);
+        NeutraliseClippedHighlightsKernel<<<grid, block, 0, s>>>(
+            ctx.rgbFloat, W, H, wb[0], wb[1], wb[2]);
         if (cudaGetLastError() != cudaSuccess) return false;
     }
 
-    ApplyMatrixCurveKernel<<<grid, block>>>(
-        gRgbFloat, W, H,
+    ApplyMatrixCurveKernel<<<grid, block, 0, s>>>(
+        ctx.rgbFloat, W, H,
         C.cam_to_output[0], C.cam_to_output[1], C.cam_to_output[2],
         C.cam_to_output[3], C.cam_to_output[4], C.cam_to_output[5],
         C.cam_to_output[6], C.cam_to_output[7], C.cam_to_output[8],
@@ -840,18 +932,18 @@ bool RunBayerChainLocked(const uint16_t* bayer_host, const float wb[3],
     if (cudaGetLastError() != cudaSuccess) return false;
 
     // Phase D: optional ACEScg->target 3D LUT (OCIO targets).
-    if (!MaybeApplyLut3D(C, W, H, grid, block)) return false;
+    if (!MaybeApplyLut3D(ctx, C, W, H, grid, block)) return false;
 
     // Phase E.3: post-transform highlight rolloff (display-encoded targets).
     if (C.highlight_recovery && C.highlight_rolloff) {
         const float kneeStart = 1.0f, kneeEnd = 1.4f;
-        HighlightRolloffKernel<<<grid, block>>>(
-            gRgbFloat, W, H, kneeStart, kneeEnd, 1.0f / (kneeEnd - kneeStart));
+        HighlightRolloffKernel<<<grid, block, 0, s>>>(
+            ctx.rgbFloat, W, H, kneeStart, kneeEnd, 1.0f / (kneeEnd - kneeStart));
         if (cudaGetLastError() != cudaSuccess) return false;
     }
 
     // Phase F: output-space denoise (chroma Gaussian + luma bilateral).
-    return RunDenoiseLocked(C, W, H, grid, block);
+    return RunDenoiseLocked(ctx, C, W, H, grid, block);
 }
 }  // namespace
 
@@ -868,12 +960,12 @@ bool ProcessBayerToRgb(
     const int W = C.width, H = C.height;
     const size_t n = size_t(W) * size_t(H);
 
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (!EnsureBuffers(W, H)) return false;
-    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
+    if (!EnsureBuffers(gRenderCtx, W, H)) return false;
+    if (!RunBayerChainLocked(gRenderCtx, bayer_host, wb, C, W, H)) return false;
 
     // Copy the result to host for the Python correctness bindings.
-    if (cudaMemcpy(rgb_host_out, gRgbFloat, n * 3 * sizeof(float),
+    if (cudaMemcpy(rgb_host_out, gRenderCtx.rgbFloat, n * 3 * sizeof(float),
                    cudaMemcpyDeviceToHost) != cudaSuccess)
         return false;
     return cudaDeviceSynchronize() == cudaSuccess;
@@ -895,8 +987,11 @@ bool ProcessBayerToRgb8(
     const BayerPipelineConstants& C,
     uint8_t* rgb8_host_out)
 {
-    // Preview fast path: full bayer chain on GPU, then clamp to 8-bit RGB888
-    // and read back (≈ width*height*3 bytes — far less than the float buffer).
+    // Preview fast path (Phase G): full bayer chain on the PREVIEW context —
+    // its own buffers, its own non-blocking stream, pinned staging both ways —
+    // then clamp to 8-bit RGB888 and read back (≈ width*height*3 bytes, far
+    // less than the float buffer). Synchronises only its own stream, so a
+    // concurrent NVENC render on the default stream is never stalled.
     if (!IsCudaAvailable()) return false;
     if (!bayer_host || !rgb8_host_out || !wb) return false;
     if (C.width <= 0 || C.height <= 0) return false;
@@ -905,25 +1000,34 @@ bool ProcessBayerToRgb8(
     const size_t n = size_t(W) * size_t(H);
     const size_t bytes = n * 3;
 
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (!EnsureBuffers(W, H)) return false;
-    if (gRgb8Bytes != bytes || !gRgb8) {
-        if (gRgb8) { cudaFree(gRgb8); gRgb8 = nullptr; }
-        if (cudaMalloc(reinterpret_cast<void**>(&gRgb8), bytes) != cudaSuccess) {
-            gRgb8 = nullptr; gRgb8Bytes = 0; return false;
+    PipelineCtx& ctx = gPreviewCtx;
+    std::lock_guard<std::mutex> lock(ctx.mtx);
+    if (!EnsureBuffers(ctx, W, H)) return false;
+    EnsurePreviewTransport(ctx, n * sizeof(uint16_t), bytes);
+    if (ctx.rgb8Bytes != bytes || !ctx.rgb8) {
+        if (ctx.rgb8) { cudaFree(ctx.rgb8); ctx.rgb8 = nullptr; }
+        if (cudaMalloc(reinterpret_cast<void**>(&ctx.rgb8), bytes) != cudaSuccess) {
+            ctx.rgb8 = nullptr; ctx.rgb8Bytes = 0; return false;
         }
-        gRgb8Bytes = bytes;
+        ctx.rgb8Bytes = bytes;
     }
-    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+    if (!RunBayerChainLocked(ctx, bayer_host, wb, C, W, H)) return false;
 
     const int total = int(bytes);
     const int block = 256;
     const int grid = (total + block - 1) / block;
-    RgbFloatToU8Kernel<<<grid, block>>>(gRgbFloat, gRgb8, total);
+    RgbFloatToU8Kernel<<<grid, block, 0, ctx.stream>>>(ctx.rgbFloat, ctx.rgb8, total);
     if (cudaGetLastError() != cudaSuccess) return false;
-    if (cudaMemcpy(rgb8_host_out, gRgb8, bytes, cudaMemcpyDeviceToHost) != cudaSuccess)
+
+    uint8_t* dst = (ctx.pinnedRgb8 && ctx.pinnedRgb8Bytes >= bytes)
+                       ? ctx.pinnedRgb8 : rgb8_host_out;
+    if (cudaMemcpyAsync(dst, ctx.rgb8, bytes, cudaMemcpyDeviceToHost,
+                        ctx.stream) != cudaSuccess)
         return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    if (cudaStreamSynchronize(ctx.stream) != cudaSuccess) return false;
+    if (dst != rgb8_host_out)
+        std::memcpy(rgb8_host_out, dst, bytes);
+    return true;
 }
 
 bool ProcessBayerToNv12(
@@ -943,12 +1047,12 @@ bool ProcessBayerToNv12(
     if (C.width <= 0 || C.height <= 0) return false;
 
     const int W = C.width, H = C.height;
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (!EnsureBuffers(W, H)) return false;
-    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
+    if (!EnsureBuffers(gRenderCtx, W, H)) return false;
+    if (!RunBayerChainLocked(gRenderCtx, bayer_host, wb, C, W, H)) return false;
 
     return RgbFloatToNv12FromDevice(
-        gRgbFloat, y_device, uv_device, W, H,
+        gRenderCtx.rgbFloat, y_device, uv_device, W, H,
         y_pitch_bytes, uv_pitch_bytes, C.yuv_matrix);
 }
 
@@ -968,12 +1072,12 @@ bool ProcessBayerToP010(
     if (C.width <= 0 || C.height <= 0) return false;
 
     const int W = C.width, H = C.height;
-    std::lock_guard<std::mutex> lock(gBufMutex);
-    if (!EnsureBuffers(W, H)) return false;
-    if (!RunBayerChainLocked(bayer_host, wb, C, W, H)) return false;
+    std::lock_guard<std::mutex> lock(gRenderCtx.mtx);
+    if (!EnsureBuffers(gRenderCtx, W, H)) return false;
+    if (!RunBayerChainLocked(gRenderCtx, bayer_host, wb, C, W, H)) return false;
 
     return RgbFloatToP010FromDevice(
-        gRgbFloat, y_device, uv_device, W, H,
+        gRenderCtx.rgbFloat, y_device, uv_device, W, H,
         y_pitch_bytes, uv_pitch_bytes, C.yuv_matrix);
 }
 
