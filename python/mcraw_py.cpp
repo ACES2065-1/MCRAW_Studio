@@ -274,9 +274,33 @@ public:
     py::tuple process_frame_rgb24(int64_t timestamp, const std::string& colorspace,
                                   bool highlight_recovery, bool bake_vignette,
                                   bool prefer_gpu, int preview_bin) {
+        return Rgb24Impl(timestamp, colorspace, highlight_recovery,
+                         bake_vignette, prefer_gpu, preview_bin, false);
+    }
+
+    // Scoped sibling for the player's scopes panel: returns
+    // (rgb_bytes, height, width, hist_bytes, clip_lo, clip_hi) where
+    // hist_bytes is 3*256 little-endian uint32 (R,G,B bins over the
+    // pre-quantize float output) and clip_lo/clip_hi are the fraction of
+    // pixels with any channel <= 0.0 / >= 1.0 BEFORE the u8 clamp.
+    py::tuple process_frame_rgb24_scopes(int64_t timestamp, const std::string& colorspace,
+                                         bool highlight_recovery, bool bake_vignette,
+                                         bool prefer_gpu, int preview_bin) {
+        return Rgb24Impl(timestamp, colorspace, highlight_recovery,
+                         bake_vignette, prefer_gpu, preview_bin, true);
+    }
+
+private:
+    py::tuple Rgb24Impl(int64_t timestamp, const std::string& colorspace,
+                        bool highlight_recovery, bool bake_vignette,
+                        bool prefer_gpu, int preview_bin, bool want_scopes) {
         mcc::OutputColorSpace cs;
         if (!mcc::ParseOutputColorSpace(colorspace, cs))
             throw std::runtime_error("unknown color space: " + colorspace);
+
+        constexpr int kSlots = 3 * 256 + 2;
+        std::vector<uint32_t> scopes;
+        if (want_scopes) scopes.assign(kSlots, 0u);
 
         std::vector<uint8_t> rawBuf;
         nlohmann::json frameMeta;
@@ -322,7 +346,8 @@ public:
                     if (!bake_vignette) { C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr; }
                     didGpu = motioncam::cuda::ProcessBayerToRgb8(
                         raw, params.asShotNeutral, C,
-                        reinterpret_cast<uint8_t*>(outBytes.data()));
+                        reinterpret_cast<uint8_t*>(outBytes.data()),
+                        want_scopes ? scopes.data() : nullptr);
                 }
             }
 #else
@@ -335,21 +360,51 @@ public:
                 if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
                     mcc::HighlightRolloff(rgbOut.data(), width, height);
                 }
-                // Float [0,1] -> uint8 [0,255], packed RGB888.
+                // Float [0,1] -> uint8 [0,255], packed RGB888. When scopes are
+                // requested, accumulate them in the same pass — bin formula
+                // matches the GPU ScopeHistogramKernel exactly.
                 uint8_t* dst = reinterpret_cast<uint8_t*>(outBytes.data());
                 const float* src = rgbOut.data();
                 const size_t n = rgbOut.size();
-                for (size_t i = 0; i < n; ++i) {
-                    float v = src[i];
-                    if (v < 0.0f) v = 0.0f;
-                    else if (v > 1.0f) v = 1.0f;
-                    dst[i] = uint8_t(v * 255.0f + 0.5f);
+                if (want_scopes) {
+                    for (size_t i = 0; i < n; i += 3) {
+                        bool lo = false, hi = false;
+                        for (int c = 0; c < 3; ++c) {
+                            float v = src[i + c];
+                            if (v <= 0.0f) lo = true;
+                            if (v >= 1.0f) hi = true;
+                            float t = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                            const int b = int(t * 255.0f + 0.5f);
+                            scopes[size_t(c) * 256 + size_t(b)] += 1u;
+                            dst[i + c] = uint8_t(b);
+                        }
+                        if (lo) scopes[768] += 1u;
+                        if (hi) scopes[769] += 1u;
+                    }
+                } else {
+                    for (size_t i = 0; i < n; ++i) {
+                        float v = src[i];
+                        if (v < 0.0f) v = 0.0f;
+                        else if (v > 1.0f) v = 1.0f;
+                        dst[i] = uint8_t(v * 255.0f + 0.5f);
+                    }
                 }
             }
         }
 
-        return py::make_tuple(py::bytes(outBytes), int(height), int(width));
+        if (!want_scopes)
+            return py::make_tuple(py::bytes(outBytes), int(height), int(width));
+
+        const double pixels = double(width) * double(height);
+        const double clipLo = pixels > 0 ? scopes[768] / pixels : 0.0;
+        const double clipHi = pixels > 0 ? scopes[769] / pixels : 0.0;
+        std::string histBytes(reinterpret_cast<const char*>(scopes.data()),
+                              size_t(3 * 256) * sizeof(uint32_t));
+        return py::make_tuple(py::bytes(outBytes), int(height), int(width),
+                              py::bytes(histBytes), clipLo, clipHi);
     }
+
+public:
 
     py::array_t<int16_t> load_audio() {
         std::vector<mc::AudioChunk> chunks;
@@ -839,7 +894,16 @@ PYBIND11_MODULE(mcraw, m) {
              "Returns (RGB888 packed bytes, height, width). No numpy required. "
              "prefer_gpu uses the CUDA bayer pipeline for baked targets (real-time preview). "
              "preview_bin>1 decimates the Bayer to 1/bin resolution first (preview proxy, "
-             "~1/bin^2 the per-pixel cost) for low-end machines.");
+             "~1/bin^2 the per-pixel cost) for low-end machines.")
+        .def("process_frame_rgb24_scopes", &PyDecoder::process_frame_rgb24_scopes,
+             py::arg("timestamp"), py::arg("colorspace") = "srgb",
+             py::arg("highlight_recovery") = false, py::arg("bake_vignette") = true,
+             py::arg("prefer_gpu") = false, py::arg("preview_bin") = 1,
+             "Like process_frame_rgb24 but also returns scope data: "
+             "(rgb_bytes, height, width, hist_bytes, clip_lo, clip_hi). "
+             "hist_bytes is 3*256 little-endian uint32 (R,G,B histogram of the "
+             "pre-quantize float output); clip_lo/clip_hi are the fractions of "
+             "pixels with any channel <= 0.0 / >= 1.0 before the 8-bit clamp.");
 
     py::class_<PyOcio>(m, "OcioTransform")
         .def(py::init<const std::string&, const std::string&>(),

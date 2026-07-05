@@ -43,6 +43,12 @@ def _qimage_bytes(img: QtGui.QImage) -> int:
         return img.width() * img.height() * 3
 
 
+def _entry_bytes(entry) -> int:
+    """Byte cost of a cache entry: (QImage, hist_bytes|None, clip_lo, clip_hi)."""
+    img, hist, _lo, _hi = entry
+    return _qimage_bytes(img) + (len(hist) if hist else 0)
+
+
 class PreviewCache:
     """LRU cache of decoded + scaled preview frames, keyed by frame index for a
     single (clip, params) signature.
@@ -64,7 +70,8 @@ class PreviewCache:
         self._enabled = bool(enabled)
         self._bytes = 0
         self._sig: tuple | None = None
-        self._store: "collections.OrderedDict[int, QtGui.QImage]" = \
+        # idx -> (QImage, hist_bytes | None, clip_lo, clip_hi)
+        self._store: "collections.OrderedDict[int, tuple]" = \
             collections.OrderedDict()
         self._lock = threading.Lock()
 
@@ -74,7 +81,7 @@ class PreviewCache:
         can't starve the cache."""
         while self._bytes > self._budget and len(self._store) > 1:
             _, old = self._store.popitem(last=False)
-            self._bytes -= _qimage_bytes(old)
+            self._bytes -= _entry_bytes(old)
 
     def set_budget(self, budget_bytes: int) -> None:
         """Change the RAM ceiling (from Preferences). Shrinks immediately if the
@@ -107,22 +114,22 @@ class PreviewCache:
             self._bytes = 0
             self._sig = None
 
-    def get(self, idx: int) -> QtGui.QImage | None:
+    def get(self, idx: int) -> tuple | None:
         with self._lock:
-            img = self._store.get(idx)
-            if img is not None:
+            entry = self._store.get(idx)
+            if entry is not None:
                 self._store.move_to_end(idx)
-            return img
+            return entry
 
-    def put(self, idx: int, img: QtGui.QImage) -> None:
+    def put(self, idx: int, entry: tuple) -> None:
         with self._lock:
             if not self._enabled or self._budget <= 0:
                 return
             if idx in self._store:
                 self._store.move_to_end(idx)
                 return
-            self._store[idx] = img
-            self._bytes += _qimage_bytes(img)
+            self._store[idx] = entry
+            self._bytes += _entry_bytes(entry)
             self._evict_locked()
 
 
@@ -282,15 +289,26 @@ class PlaybackWorker(QtCore.QObject):
     """
     # path, frame_idx, image, achieved_fps, target_fps, from_cache
     frame = QtCore.Signal(str, int, QtGui.QImage, float, float, bool)
+    # path, frame_idx, hist_bytes (3*256 LE uint32), clip_lo, clip_hi
+    scopes = QtCore.Signal(str, int, bytes, float, float)
     finished = QtCore.Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        # Scopes are opt-in (the panel is hidden by default); the flag is
+        # sampled at play() time and baked into the cache signature so cached
+        # frames always carry matching scope data.
+        self._scopes_enabled = False
         # Live preview cache: first play fills it, replays/loops read it back at
         # the target rate. Persists across play/stop (the worker outlives both).
         self._cache = PreviewCache()
+
+    def set_scopes_enabled(self, enabled: bool) -> None:
+        """Toggle scope computation. Caller should clear the cache and restart
+        playback for it to take effect mid-play (mirrors the quality combo)."""
+        self._scopes_enabled = bool(enabled)
 
     def clear_cache(self) -> None:
         """Drop the cached preview frames (free memory on close / param change)."""
@@ -346,19 +364,30 @@ class PlaybackWorker(QtCore.QObject):
         # runs the CUDA bayer pipeline for baked targets); else CPU.
         use_gpu = bool(prefer_gpu and mcraw.cuda_available())
         preview_bin = max(1, int(preview_bin))
+        want_scopes = bool(self._scopes_enabled)
         # Point the live cache at this clip+params. The first pass decodes &
         # fills it (may run below real-time); replays and later loop passes read
         # it back, so they hit the target rate even on a slow CPU path. The bin
-        # factor is part of the key so each preview quality caches separately.
-        self._cache.set_signature((path, bool(bake), int(max_dim), use_gpu, preview_bin))
+        # factor is part of the key so each preview quality caches separately;
+        # so is the scopes flag, since cached entries carry their scope data.
+        self._cache.set_signature((path, bool(bake), int(max_dim), use_gpu,
+                                   preview_bin, want_scopes))
         while not self._stop.is_set():
             t0 = time.perf_counter()
-            img = self._cache.get(idx)
-            from_cache = img is not None
-            if not from_cache:
+            entry = self._cache.get(idx)
+            from_cache = entry is not None
+            if from_cache:
+                img, hist, clip_lo, clip_hi = entry
+            else:
                 try:
-                    buf, h, w = d.process_frame_rgb24(ts[idx], "srgb", False,
-                                                      bake, use_gpu, preview_bin)
+                    if want_scopes:
+                        buf, h, w, hist, clip_lo, clip_hi = \
+                            d.process_frame_rgb24_scopes(ts[idx], "srgb", False,
+                                                         bake, use_gpu, preview_bin)
+                    else:
+                        buf, h, w = d.process_frame_rgb24(ts[idx], "srgb", False,
+                                                          bake, use_gpu, preview_bin)
+                        hist, clip_lo, clip_hi = None, 0.0, 0.0
                 except Exception as exc:
                     print(f"[play] decode failed frame {idx}: {exc}")
                     break
@@ -368,10 +397,12 @@ class PlaybackWorker(QtCore.QObject):
                                      QtCore.Qt.SmoothTransformation)
                 else:
                     img = img.copy()  # detach from `buf` before it's freed
-                self._cache.put(idx, img)
+                self._cache.put(idx, (img, hist, clip_lo, clip_hi))
             dt = time.perf_counter() - t0
             achieved = (1.0 / dt) if dt > 0 else fps
             self.frame.emit(path, idx, img, achieved, fps, from_cache)
+            if want_scopes and hist is not None:
+                self.scopes.emit(path, idx, hist, clip_lo, clip_hi)
             idx += 1
             if idx >= end_idx:
                 if not loop:
@@ -423,6 +454,108 @@ class FullscreenPreview(QtWidgets.QWidget):
 
     def mouseDoubleClickEvent(self, e: QtGui.QMouseEvent) -> None:
         self._owner._exit_fullscreen()
+
+
+class ScopePanel(QtWidgets.QWidget):
+    """RGB histogram + clipping readout for the preview player.
+
+    Shows the distribution of the displayed image (3 x 256 bins, log-scaled
+    counts) with the R/G/B channels overlaid, plus the fraction of pixels
+    clipping above 1.0 / below 0.0 measured on the PRE-quantize float output
+    (so highlight clipping is real, not a byproduct of the 8-bit preview).
+    Fed by PlaybackWorker.scopes during playback and by the thumb decoder
+    while scrubbing.
+    """
+
+    _COLORS = (QtGui.QColor(224, 85, 85),     # R
+               QtGui.QColor(85, 201, 100),    # G
+               QtGui.QColor(90, 160, 232))    # B
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumHeight(96)
+        self.setMaximumHeight(140)
+        self._hist: list[list[float]] | None = None   # 3 x 256, log-scaled 0..1
+        self._clip_lo = 0.0
+        self._clip_hi = 0.0
+
+    def clear(self) -> None:
+        self._hist = None
+        self._clip_lo = 0.0
+        self._clip_hi = 0.0
+        self.update()
+
+    def set_data(self, hist_bytes: bytes, clip_lo: float, clip_hi: float) -> None:
+        """hist_bytes: 3*256 little-endian uint32 (numpy-free — the bundle
+        excludes numpy, so parse with array + math)."""
+        import math
+        from array import array
+        raw = array("I", hist_bytes)
+        if len(raw) != 768:
+            return
+        out: list[list[float]] = []
+        for c in range(3):
+            ch = raw[c * 256:(c + 1) * 256]
+            peak = max(ch) or 1
+            log_peak = math.log1p(peak)
+            out.append([math.log1p(v) / log_peak for v in ch])
+        self._hist = out
+        self._clip_lo = float(clip_lo)
+        self._clip_hi = float(clip_hi)
+        self.update()
+
+    def paintEvent(self, _e: QtGui.QPaintEvent) -> None:
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), QtGui.QColor(16, 16, 16))
+        w, h = self.width(), self.height()
+        pad = 6
+        plot_w, plot_h = w - 2 * pad, h - 2 * pad
+        if plot_w <= 10 or plot_h <= 10:
+            p.end()
+            return
+
+        # Quarter gridlines.
+        p.setPen(QtGui.QColor(40, 40, 40))
+        for q in (0.25, 0.5, 0.75):
+            x = pad + int(plot_w * q)
+            p.drawLine(x, pad, x, pad + plot_h)
+
+        if self._hist is None:
+            p.setPen(QtGui.QColor(120, 120, 120))
+            p.drawText(self.rect(), QtCore.Qt.AlignCenter, "(no scope data)")
+            p.end()
+            return
+
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_Plus)
+        for c in range(3):
+            col = QtGui.QColor(self._COLORS[c])
+            col.setAlpha(150)
+            poly = QtGui.QPolygonF()
+            poly.append(QtCore.QPointF(pad, pad + plot_h))
+            vals = self._hist[c]
+            for i in range(256):
+                x = pad + plot_w * (i / 255.0)
+                y = pad + plot_h * (1.0 - vals[i])
+                poly.append(QtCore.QPointF(x, y))
+            poly.append(QtCore.QPointF(pad + plot_w, pad + plot_h))
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(col)
+            p.drawPolygon(poly)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode_SourceOver)
+
+        # Clip readout, top-right. Highlight clipping turns hot when > 0.1%.
+        p.setFont(QtGui.QFont(self.font().family(), 8))
+        hi_hot = self._clip_hi > 0.001
+        p.setPen(QtGui.QColor(240, 120, 90) if hi_hot else QtGui.QColor(150, 150, 150))
+        txt_hi = f"▲ {self._clip_hi * 100.0:.2f}%"
+        txt_lo = f"▼ {self._clip_lo * 100.0:.2f}%"
+        p.drawText(QtCore.QRect(pad, pad, plot_w - 4, 14),
+                   QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, txt_hi)
+        p.setPen(QtGui.QColor(150, 150, 150))
+        p.drawText(QtCore.QRect(pad, pad + 14, plot_w - 4, 14),
+                   QtCore.Qt.AlignRight | QtCore.Qt.AlignTop, txt_lo)
+        p.end()
 
 
 # ----- Transport icons (drawn with QPainter — crisp, themeable, no assets) ---
@@ -484,6 +617,14 @@ def transport_icon(kind: str, color: str = "#dcdcdc", size: int = 64) -> QtGui.Q
         p.drawArc(r, 75 * 16, 250 * 16)  # ~3/4 ring, gap upper-right
         fill()  # arrowhead at the ring's open (upper) end
         poly([(32, 9), (32, 23), (40, 16)])
+    elif kind == "scope":
+        fill()
+        # Tiny histogram: four bars of varying height on a baseline.
+        for bx, bh_ in ((16, 14), (24, 26), (32, 34), (40, 20)):
+            p.drawRoundedRect(
+                QtCore.QRectF(pt(bx, 48 - bh_), pt(bx + 6, 48)), 1.5 * s, 1.5 * s)
+        stroke(4)
+        polyline([(14, 50), (50, 50)])
     elif kind in ("vol_on", "vol_off"):
         fill()
         poly([(16, 26), (24, 26), (34, 17), (34, 47), (24, 38), (16, 38)])

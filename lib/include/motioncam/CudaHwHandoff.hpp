@@ -186,11 +186,21 @@ bool ProcessBayerToRgb(
 // Preview variant: runs the same chain but returns clamped 8-bit RGB888 to
 // host (width*height*3 bytes). Used by the GUI real-time player so the
 // per-frame readback is small. Returns false on any CUDA error.
+//
+// scope_out (optional): 770 uint32s — RGB histogram of the PRE-QUANTIZE
+// float output (3 x 256 bins, R then G then B; bin = round(clamp(v,0,1)*255))
+// followed by [768] = pixels with any channel <= 0.0 and [769] = pixels with
+// any channel >= 1.0. Measured before the u8 clamp so clipping is real, not
+// an artifact of quantisation. Adds one small kernel + a ~3 KB readback.
 bool ProcessBayerToRgb8(
     const uint16_t* bayer_host,
     const float wb[3],
     const BayerPipelineConstants& consts,
-    uint8_t* rgb8_host_out);
+    uint8_t* rgb8_host_out,
+    uint32_t* scope_out = nullptr);
+
+// Number of uint32 slots scope_out must provide.
+constexpr int kScopeSlots = 3 * 256 + 2;
 
 // Phase C.2 entry point. Same bayer pipeline as ProcessBayerToRgb but
 // instead of copying the result to host, hands the GPU RGB straight to

@@ -66,6 +66,7 @@ from player import (  # noqa: E402
     AudioPlayer,
     FullscreenPreview,
     PlaybackWorker,
+    ScopePanel,
     transport_icon,
 )
 
@@ -488,8 +489,11 @@ class ThumbWorker(QtCore.QObject):
 
     Signals don't care which thread emits them — Qt queues across the main
     thread automatically, so the decode runs detached from the GUI loop.
+    Always decodes through the scopes binding (the histogram pass is cheap)
+    so the scopes panel tracks the scrub position, not just playback.
     """
-    done = QtCore.Signal(str, int, QtGui.QImage)
+    # path, frame_idx, image, hist_bytes (3*256 LE uint32), clip_lo, clip_hi
+    done = QtCore.Signal(str, int, QtGui.QImage, bytes, float, float)
 
     def submit(self, path: str, frame_idx: int, bake_vignette: bool = True) -> None:
         threading.Thread(
@@ -506,8 +510,8 @@ class ThumbWorker(QtCore.QObject):
             if frame_idx < 0 or frame_idx >= len(timestamps):
                 return
             # numpy-free path: C++ side returns RGB888 packed bytes directly.
-            buf, h, w = d.process_frame_rgb24(timestamps[frame_idx], "srgb",
-                                              False, bake_vignette)
+            buf, h, w, hist, clip_lo, clip_hi = d.process_frame_rgb24_scopes(
+                timestamps[frame_idx], "srgb", False, bake_vignette)
             full = QtGui.QImage(buf, w, h, 3 * w, QtGui.QImage.Format_RGB888)
             if w > self._PREVIEW_MAX_W or h > self._PREVIEW_MAX_H:
                 img = full.scaled(
@@ -517,7 +521,7 @@ class ThumbWorker(QtCore.QObject):
                 )
             else:
                 img = full.copy()
-            self.done.emit(path, frame_idx, img)
+            self.done.emit(path, frame_idx, img, hist, clip_lo, clip_hi)
         except Exception as exc:
             print(f"[thumb] decode failed for {Path(path).name} frame {frame_idx}: {exc}")
 
@@ -709,7 +713,9 @@ class MainWindow(QtWidgets.QMainWindow):
         # Real-time playback engine + transport state.
         self._player = PlaybackWorker()
         self._player.frame.connect(self._on_play_frame)
+        self._player.scopes.connect(self._on_play_scopes)
         self._player.finished.connect(self._on_play_finished)
+        self._scopes_on = bool(self._prefs.get("scopes_visible", False))
         self._fs_window = None
         self._muted = False
         self._volume = 0.8
@@ -845,10 +851,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self.volumeSlider.valueChanged.connect(self._on_volume_changed)
         transport.addWidget(self.volumeSlider)
         transport.addSpacing(8)
+        self.scopeBtn = _tbtn("scope", "Show / hide RGB scopes (histogram + clipping)",
+                              self._toggle_scopes)
+        self.scopeBtn.setEnabled(True)
+        self.scopeBtn.setCheckable(True)
+        self.scopeBtn.setChecked(self._scopes_on)
+        transport.addWidget(self.scopeBtn)
         self.fullscreenBtn = _tbtn("fullscreen", "Fullscreen preview (F / Esc to exit)",
                                    self._toggle_fullscreen)
         transport.addWidget(self.fullscreenBtn)
         pv.addLayout(transport)
+
+        # RGB scopes: histogram of the displayed image + pre-quantize clip
+        # fractions. Hidden unless toggled; fed by playback and scrub decodes.
+        self.scopePanel = ScopePanel()
+        self.scopePanel.setVisible(self._scopes_on)
+        self._player.set_scopes_enabled(self._scopes_on)
+        pv.addWidget(self.scopePanel)
 
         topSplit.addWidget(previewBox)
         topSplit.setStretchFactor(0, 1)
@@ -1789,8 +1808,9 @@ class MainWindow(QtWidgets.QMainWindow):
         bake = self.vignetteCheck.isChecked() if hasattr(self, "vignetteCheck") else True
         self._thumb.submit(path, int(st["scrub"]), bake)
 
-    @QtCore.Slot(str, int, QtGui.QImage)
-    def _on_thumb_done(self, path: str, frame_idx: int, img: QtGui.QImage) -> None:
+    @QtCore.Slot(str, int, QtGui.QImage, bytes, float, float)
+    def _on_thumb_done(self, path: str, frame_idx: int, img: QtGui.QImage,
+                       hist: bytes, clip_lo: float, clip_hi: float) -> None:
         st = self._file_state.get(path)
         if not st:
             return
@@ -1800,6 +1820,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # hasn't moved the scrubber to a different frame in the meantime.
         if self._current_path() == path and st["scrub"] == frame_idx:
             self._set_preview_pixmap(QtGui.QPixmap.fromImage(img))
+            if self._scopes_on and not self._player.is_playing():
+                self.scopePanel.set_data(hist, clip_lo, clip_hi)
 
     @QtCore.Slot()
     def _mark_in(self) -> None:
@@ -1945,6 +1967,32 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_play_finished(self, path: str) -> None:
         self._audio.stop()
         self.playBtn.setIcon(self._icon_play)
+
+    @QtCore.Slot(str, int, bytes, float, float)
+    def _on_play_scopes(self, path: str, _idx: int, hist: bytes,
+                        clip_lo: float, clip_hi: float) -> None:
+        if self._scopes_on and self._current_path() == path:
+            self.scopePanel.set_data(hist, clip_lo, clip_hi)
+
+    @QtCore.Slot()
+    def _toggle_scopes(self) -> None:
+        """Show/hide the RGB scopes panel. Scope data rides along with each
+        decoded frame, so toggling drops the preview cache (its entries were
+        built with the other setting) and restarts playback if running —
+        same pattern as the preview-quality combo."""
+        self._scopes_on = not self._scopes_on
+        self.scopeBtn.setChecked(self._scopes_on)
+        self.scopePanel.setVisible(self._scopes_on)
+        self._prefs["scopes_visible"] = self._scopes_on
+        self._save_config()
+        self._player.set_scopes_enabled(self._scopes_on)
+        self._player.clear_cache()
+        if self._player.is_playing():
+            self._stop_playback()
+            self._toggle_play()
+        elif self._scopes_on:
+            self.scopePanel.clear()
+            self._kick_thumb_decode()   # populate from the current scrub frame
 
     @QtCore.Slot()
     def _toggle_mute(self) -> None:

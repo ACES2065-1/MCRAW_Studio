@@ -77,6 +77,8 @@ struct PipelineCtx {
     uint8_t*  pinnedRgb8       = nullptr;
     size_t    pinnedRgb8Bytes  = 0;
     bool      usePinned        = false;
+    // Scope histogram accumulator (kScopeSlots uint32, preview ctx only).
+    uint32_t* scopeDev         = nullptr;
     // 0 = legacy default stream (render). The preview ctx lazily creates a
     // cudaStreamNonBlocking stream so it never implicitly syncs with the
     // render's default-stream work.
@@ -203,6 +205,7 @@ void ReleaseCtxLocked(PipelineCtx& ctx) {
     if (ctx.lsmDevice)   { cudaFree(ctx.lsmDevice);       ctx.lsmDevice   = nullptr; }
     if (ctx.pinnedBayer) { cudaFreeHost(ctx.pinnedBayer); ctx.pinnedBayer = nullptr; ctx.pinnedBayerBytes = 0; }
     if (ctx.pinnedRgb8)  { cudaFreeHost(ctx.pinnedRgb8);  ctx.pinnedRgb8  = nullptr; ctx.pinnedRgb8Bytes = 0; }
+    if (ctx.scopeDev)    { cudaFree(ctx.scopeDev);        ctx.scopeDev    = nullptr; }
     ReleaseDenoiseLocked(ctx);
     ctx.bufW = 0;
     ctx.bufH = 0;
@@ -1056,6 +1059,39 @@ bool ProcessBayerToRgb(
     return cudaDeviceSynchronize() == cudaSuccess;
 }
 
+// Scopes: RGB histogram + clip counters over the pre-quantize float output.
+// Layout matches kScopeSlots: 3x256 bins (R,G,B) then [768]=any-channel<=0
+// pixel count, [769]=any-channel>=1 pixel count. Shared-memory privatised
+// per block, merged with global atomics. Bin formula matches the u8 clamp
+// (round(clamp(v,0,1)*255)) so the histogram is exactly the distribution of
+// the displayed image, while the clip counters see the un-clamped floats.
+__global__ void ScopeHistogramKernel(const float* __restrict__ rgb,
+                                     int pixels,
+                                     uint32_t* __restrict__ out) {
+    __shared__ uint32_t sh[770];
+    for (int i = threadIdx.x; i < 770; i += blockDim.x) sh[i] = 0;
+    __syncthreads();
+
+    const int stride = blockDim.x * gridDim.x;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < pixels; i += stride) {
+        bool lo = false, hi = false;
+        #pragma unroll
+        for (int c = 0; c < 3; ++c) {
+            const float v = rgb[size_t(i) * 3 + c];
+            if (v <= 0.0f) lo = true;
+            if (v >= 1.0f) hi = true;
+            float t = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            const int b = int(t * 255.0f + 0.5f);
+            atomicAdd(&sh[c * 256 + b], 1u);
+        }
+        if (lo) atomicAdd(&sh[768], 1u);
+        if (hi) atomicAdd(&sh[769], 1u);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < 770; i += blockDim.x)
+        if (sh[i]) atomicAdd(&out[i], sh[i]);
+}
+
 // Preview: clamp float RGB [0,1] -> uint8 RGB888 (n = pixels*3 components).
 __global__ void RgbFloatToU8Kernel(const float* __restrict__ rgb,
                                    uint8_t* __restrict__ out, int n) {
@@ -1070,7 +1106,8 @@ bool ProcessBayerToRgb8(
     const uint16_t* bayer_host,
     const float wb[3],
     const BayerPipelineConstants& C,
-    uint8_t* rgb8_host_out)
+    uint8_t* rgb8_host_out,
+    uint32_t* scope_out)
 {
     // Preview fast path (Phase G): full bayer chain on the PREVIEW context —
     // its own buffers, its own non-blocking stream, pinned staging both ways —
@@ -1104,6 +1141,23 @@ bool ProcessBayerToRgb8(
     RgbFloatToU8Kernel<<<grid, block, 0, ctx.stream>>>(ctx.rgbFloat, ctx.rgb8, total);
     if (cudaGetLastError() != cudaSuccess) return false;
 
+    // Optional scopes: histogram the float output on-device (tiny readback).
+    if (scope_out) {
+        const size_t scopeBytes = size_t(kScopeSlots) * sizeof(uint32_t);
+        if (!ctx.scopeDev &&
+            cudaMalloc(reinterpret_cast<void**>(&ctx.scopeDev), scopeBytes)
+                != cudaSuccess) {
+            ctx.scopeDev = nullptr;
+            return false;
+        }
+        if (cudaMemsetAsync(ctx.scopeDev, 0, scopeBytes, ctx.stream) != cudaSuccess)
+            return false;
+        const int hgrid = std::min(256, (int(n) + block - 1) / block);
+        ScopeHistogramKernel<<<hgrid, block, 0, ctx.stream>>>(
+            ctx.rgbFloat, int(n), ctx.scopeDev);
+        if (cudaGetLastError() != cudaSuccess) return false;
+    }
+
     uint8_t* dst = (ctx.pinnedRgb8 && ctx.pinnedRgb8Bytes >= bytes)
                        ? ctx.pinnedRgb8 : rgb8_host_out;
     if (cudaMemcpyAsync(dst, ctx.rgb8, bytes, cudaMemcpyDeviceToHost,
@@ -1112,6 +1166,13 @@ bool ProcessBayerToRgb8(
     if (cudaStreamSynchronize(ctx.stream) != cudaSuccess) return false;
     if (dst != rgb8_host_out)
         std::memcpy(rgb8_host_out, dst, bytes);
+    if (scope_out) {
+        // ~3 KB, stream already idle — a plain sync copy is fine here.
+        if (cudaMemcpy(scope_out, ctx.scopeDev,
+                       size_t(kScopeSlots) * sizeof(uint32_t),
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+    }
     return true;
 }
 
