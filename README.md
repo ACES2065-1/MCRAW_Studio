@@ -34,6 +34,11 @@ isn't code-signed yet; click *More info* → *Run anyway*.
 - **Malvar-He-Cutler demosaic** (v0.7) — gradient-corrected debayer replaces
   bilinear on both the CPU and GPU pipelines; noticeably less zipper and
   color fringing on high-contrast edges
+- **Fast professional intermediates** (v0.7) — ProRes / DNxHR / CineForm
+  encoders now use every CPU core, and on NVIDIA GPUs the RAW→YUV pipeline
+  runs on the GPU with only packed 10-bit planes crossing the bus. At 4K:
+  DNxHR HQX 14.4 fps (was 2.3), CineForm 27.1 (was 5.9), ProRes 4444 3.4
+  (was 1.2)
 - **Outputs**:
   - **MP4** (H.264 / H.265 / AV1) — for delivery and "normal video" playback
   - **MOV** (ProRes 422 / 422 HQ / 4444 / 4444 XQ, DNxHR HQX / 444, CineForm)

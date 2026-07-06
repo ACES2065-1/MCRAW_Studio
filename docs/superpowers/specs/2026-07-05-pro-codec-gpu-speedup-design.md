@@ -1,7 +1,13 @@
 # Phase I — Fast professional-format renders (encoder threading + GPU pixel packing)
 
 **Date:** 2026-07-05
-**Status:** Approved (Approach A)
+**Status:** Implemented 2026-07-06. Final numbers (MCRAW_GPU_YUV=1):
+dnxhr_hqx 14.4 fps (target met), cineform 27.1, prores422hq 4.8,
+prores4444 3.4 — prores_ks is now purely encoder-bound, so the 10 fps
+ProRes target needs Approach C (frame-parallel encode), per the fallback
+clause below. Implementation also fixed a latent E.2-class bug: the pro
+intermediates' sws path defaulted to BT.601 while their tags/decoders
+assume BT.709 — now pinned. See test/bench_pro_codecs.py RESULTS.
 **Owner:** MCRAW Studio
 
 ## Problem
