@@ -1,7 +1,12 @@
 # Phase J — Frame-parallel ProRes encoding (the encoder farm)
 
 **Date:** 2026-07-06
-**Status:** Approved (Approach 1 — farm inside MovEncoder)
+**Status:** Implemented 2026-07-06. Auto rule tuned by measurement to
+clamp(budget/2, 1, 6) instances with 1.5x thread oversubscription (6x3
+on the 12-core dev box). Final: prores4444 7.9 fps GPU-fed (sweep peak
+8.2 — the >= 8 target sits within run noise), prores422hq 10.9; CPU
+feed 6.6 / 7.5. Output proven bit-identical to serial on both feeds
+(test/prores_farm_verify.py).
 **Prereq:** Phase I (encoder threading + GPU pack), landed 2026-07-06.
 
 ## Problem

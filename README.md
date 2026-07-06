@@ -36,9 +36,11 @@ isn't code-signed yet; click *More info* → *Run anyway*.
   color fringing on high-contrast edges
 - **Fast professional intermediates** (v0.7) — ProRes / DNxHR / CineForm
   encoders now use every CPU core, and on NVIDIA GPUs the RAW→YUV pipeline
-  runs on the GPU with only packed 10-bit planes crossing the bus. At 4K:
-  DNxHR HQX 15.4 fps (was 2.3), CineForm 28.7 (was 5.9), ProRes 4444 3.2
-  (was 1.2)
+  runs on the GPU with only packed 10-bit planes crossing the bus. ProRes
+  additionally gets a frame-parallel encoder farm (intra-only, so the
+  output is bit-identical to serial encoding). At 4K: DNxHR HQX 15.4 fps
+  (was 2.3), CineForm 28.7 (was 5.9), ProRes 422 HQ 10.9 (was 1.7),
+  ProRes 4444 7.9 (was 1.2)
 - **Outputs**:
   - **MP4** (H.264 / H.265 / AV1) — for delivery and "normal video" playback
   - **MOV** (ProRes 422 / 422 HQ / 4444 / 4444 XQ, DNxHR HQX / 444, CineForm)
