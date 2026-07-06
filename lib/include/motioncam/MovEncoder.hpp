@@ -55,6 +55,11 @@ struct EncodeSettings {
     // libx264/x265 manage their own pools and NVENC is hardware — both
     // ignore this field.
     int encoderThreads = 0;
+    // Phase J: parallel prores_ks instances (frame-parallel farm; output
+    // is bit-identical to serial). 0 = auto (clamp(threads/3, 1, 4)),
+    // 1 = serial/off, N = explicit (clamped to the thread budget).
+    // ProRes profiles only; other codecs ignore this field.
+    int encoderInstances = 0;
     // QuickTime 'nclc' / MP4 color tag (FFmpeg AVCOL_* enum values).
     // Use 2 (UNSPECIFIED) for spaces with no clean mapping (ACEScg, S-Log3, etc.).
     int colorPrimaries = 2;

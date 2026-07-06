@@ -581,7 +581,8 @@ static void DoRender(
     bool highlight_recovery,
     double frame_rate_conversion,
     bool bake_vignette,
-    int encoder_threads)
+    int encoder_threads,
+    int encoder_instances)
 {
     // Convert all py::object args to native C++ types while we still hold the GIL.
     int start_arg = start_obj.is_none() ? 0 : start_obj.cast<int>();
@@ -667,6 +668,7 @@ static void DoRender(
         es.containerFormat = EndsWithMp4(output) ? "mp4" : "mov";
         es.tenBit = ten_bit;
         es.encoderThreads = encoder_threads;
+        es.encoderInstances = encoder_instances;
         es.colorPrimaries = csInfo.qtPrimaries;
         es.colorTrc       = csInfo.qtTransfer;
         es.colorMatrix    = csInfo.qtMatrix;
@@ -1119,6 +1121,7 @@ PYBIND11_MODULE(mcraw, m) {
         py::arg("frame_rate_conversion") = 0.0,
         py::arg("bake_vignette") = true,
         py::arg("encoder_threads") = 0,
+        py::arg("encoder_instances") = 0,
         R"doc(Render an MCRAW file end-to-end.
 
 If `output` ends in '.mov', encodes a QuickTime file (codec defaults to prores4444).
@@ -1131,6 +1134,8 @@ frame_rate_conversion: target fps to convert to (duplicate/drop to keep A/V
             sync); 0 = keep the source rate. bake_vignette: apply the lens
             shading gainmap (default True); False keeps the natural vignette.
 encoder_threads: worker threads for ProRes/DNxHR/CineForm (0 = all cores).
+encoder_instances: parallel ProRes encoder instances (0 = auto, 1 = off);
+            output is bit-identical to serial encoding.
 )doc");
 
     // Frame-rate plan preview for the GUI clip header: returns the detected

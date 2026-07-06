@@ -41,6 +41,7 @@ struct Args {
     motioncam::video::Codec codec = motioncam::video::Codec::ProRes4444;
     int bitrateMbps = 80;
     int encoderThreads = 0;  // ProRes/DNxHR/CineForm encoder threads; 0 = all cores
+    int encoderInstances = 0;  // Parallel ProRes instances; 0 = auto, 1 = off
     double fpsOverride = 0.0;
     double convertFps = 0.0;   // >0: frame-rate-convert (duplicate/drop) to this constant rate
     motioncam::color::ExrCompression exrCompression = motioncam::color::ExrCompression::ZIP;
@@ -67,6 +68,8 @@ void PrintUsage() {
         "                            Other codecs already use their native bit depth.\n"
         "  --bitrate <Mbps>        H.264/H.265 target bitrate (default: 80)\n"
         "  --threads <n>           ProRes/DNxHR/CineForm encoder threads (default: all cores)\n"
+        "  --instances <n>         Parallel ProRes encoder instances (default: auto;\n"
+        "                            1 disables the farm; output is bit-identical either way)\n"
         "  --fps <num>             Override frame rate (default: estimated from timestamps)\n"
         "  --start <n>             First frame index (default: 0)\n"
         "  --end <n>               End frame index, exclusive (default: all)\n"
@@ -125,6 +128,7 @@ bool ParseArgs(int argc, const char* argv[], Args& out) {
         }
         else if (a == "--bitrate") out.bitrateMbps = std::stoi(needValue());
         else if (a == "--threads") out.encoderThreads = std::stoi(needValue());
+        else if (a == "--instances") out.encoderInstances = std::stoi(needValue());
         else if (a == "--fps") out.fpsOverride = std::stod(needValue());
         else if (a == "--convert-fps") out.convertFps = std::stod(needValue());
         else if (a == "--start") out.startFrame = std::stoi(needValue());
@@ -271,6 +275,7 @@ int RunMov(motioncam::Decoder& decoder, const Args& args, int start, int end) {
     es.containerFormat = ContainerName(args.format);
     es.tenBit = args.tenBit;
     es.encoderThreads = args.encoderThreads;
+    es.encoderInstances = args.encoderInstances;
     es.colorPrimaries = csInfo.qtPrimaries;
     es.colorTrc       = csInfo.qtTransfer;
     es.colorMatrix    = csInfo.qtMatrix;

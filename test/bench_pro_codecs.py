@@ -15,6 +15,11 @@ RESULTS (dev box: RTX 4090, 12-core, 4032x1696, 48 frames, acescg):
     (env unset, CPU path: 2.9 / 3.9 / 9.1 / 13.1 — sws now pinned BT.709)
     prores_ks remains encoder-bound; frame-parallel encoding (Approach C
     in the spec) is the documented next step if ProRes needs more.
+  2026-07-06 after Phase J (ProRes farm, auto 6 instances x 3 threads):
+    GPU feed: prores4444 7.9 | prores422hq 10.9 (sweep peak 8.2 / 11.x)
+    CPU feed: prores4444 6.6 | prores422hq 7.5
+    dnxhr/cineform unchanged (not farmed). Output bit-identical to
+    serial (test/prores_farm_verify.py).
 
 Usage:  python test/bench_pro_codecs.py [clip.mcraw] [--frames N]
 Respects MCRAW_GPU_YUV; run it in both states when benchmarking A2.

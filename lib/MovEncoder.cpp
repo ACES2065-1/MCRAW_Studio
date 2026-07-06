@@ -16,11 +16,17 @@ extern "C" {
 #include <vector>
 #endif
 
+#include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <map>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace motioncam {
 namespace video {
@@ -163,6 +169,293 @@ struct MovEncoder::Impl {
     bool useGpuPackPipeline = false;
     bool packSubsample422   = false;
 #endif
+
+    // ----- Phase J: ProRes encoder farm ----------------------------------
+    //
+    // prores_ks is intra-only with per-frame bit targeting, so frames can
+    // be encoded by independent instances and muxed back in order with
+    // output bit-identical to serial encoding. N workers each own an
+    // opened context (worker 0 reuses videoCtx); a single muxer thread
+    // writes packets strictly in frame order — it is the only thread
+    // touching the muxer while video is in flight. WriteVideoFrame /
+    // WriteVideoFrameYuv10 become bounded submits when the farm is active.
+    struct FarmJob {
+        int64_t idx = 0;
+        bool planar = false;
+        PlanarYuvFrame yuv;          // planar payload (GPU pack path)
+        std::vector<float> rgb;      // interleaved float payload (CPU path)
+    };
+    struct Farm {
+        int instances = 0;
+        std::vector<AVCodecContext*> ctxs;   // [0] aliases videoCtx (not owned)
+        std::vector<std::thread> workers;
+        std::thread muxer;
+
+        std::mutex inMtx;
+        std::condition_variable inNotFull, inNotEmpty;
+        std::deque<FarmJob> inQ;
+        size_t inCap = 4;
+        bool inClosed = false;
+        int64_t submitted = 0;
+
+        std::mutex outMtx;
+        std::condition_variable outCv;
+        std::map<int64_t, AVPacket*> ready;  // pkt->pts (== frame idx) -> packet
+        int workersDone = 0;
+
+        std::mutex errMtx;
+        std::exception_ptr err;
+        std::atomic<bool> abortFlag{false};
+        bool drained = false;
+    };
+    int farmPlannedInstances = 1;
+    std::unique_ptr<Farm> farm;
+
+    void FarmSetError(std::exception_ptr e) {
+        {
+            std::lock_guard<std::mutex> lk(farm->errMtx);
+            if (!farm->err) farm->err = e;
+        }
+        farm->abortFlag.store(true);
+        farm->inNotFull.notify_all();
+        farm->inNotEmpty.notify_all();
+        farm->outCv.notify_all();
+    }
+
+    void FarmRethrow() {
+        std::lock_guard<std::mutex> lk(farm->errMtx);
+        if (farm->err) std::rethrow_exception(farm->err);
+    }
+
+    void FarmSubmit(FarmJob&& job) {
+        FarmRethrow();
+        std::unique_lock<std::mutex> lk(farm->inMtx);
+        farm->inNotFull.wait(lk, [&] {
+            return farm->inQ.size() < farm->inCap || farm->abortFlag.load();
+        });
+        if (farm->abortFlag.load()) {
+            lk.unlock();
+            FarmRethrow();
+            Throw("farm aborted");
+        }
+        job.idx = farm->submitted++;
+        farm->inQ.push_back(std::move(job));
+        lk.unlock();
+        farm->inNotEmpty.notify_one();
+    }
+
+    // Close input, join workers (each flushes its context), join the muxer,
+    // rethrow the first captured error. Idempotent.
+    void FarmDrain() {
+        if (!farm || farm->drained) return;
+        {
+            std::lock_guard<std::mutex> lk(farm->inMtx);
+            farm->inClosed = true;
+        }
+        farm->inNotEmpty.notify_all();
+        for (auto& w : farm->workers)
+            if (w.joinable()) w.join();
+        farm->outCv.notify_all();
+        if (farm->muxer.joinable()) farm->muxer.join();
+        farm->drained = true;
+        FarmRethrow();
+    }
+
+    void FarmWorker(int wi) {
+        AVCodecContext* ctx = farm->ctxs[size_t(wi)];
+        AVFrame* yf = av_frame_alloc();
+        AVFrame* rgbStg = nullptr;
+        SwsContext* mySws = nullptr;
+        AVPacket* wpkt = av_packet_alloc();
+        try {
+            if (!yf || !wpkt) throw std::runtime_error("farm: alloc failed");
+            yf->format = yuvFrame->format;
+            yf->width = settings.width;
+            yf->height = settings.height;
+            if (av_frame_get_buffer(yf, 0) < 0)
+                throw std::runtime_error("farm: frame buffer alloc failed");
+
+            const int w = settings.width;
+            const int h = settings.height;
+            while (true) {
+                FarmJob job;
+                {
+                    std::unique_lock<std::mutex> lk(farm->inMtx);
+                    farm->inNotEmpty.wait(lk, [&] {
+                        return !farm->inQ.empty() || farm->inClosed ||
+                               farm->abortFlag.load();
+                    });
+                    if (farm->abortFlag.load()) break;
+                    if (farm->inQ.empty()) break;   // closed + empty
+                    job = std::move(farm->inQ.front());
+                    farm->inQ.pop_front();
+                }
+                farm->inNotFull.notify_one();
+
+                if (av_frame_make_writable(yf) < 0)
+                    throw std::runtime_error("farm: make_writable failed");
+
+                if (job.planar) {
+                    const auto& f = job.yuv;
+                    for (int row = 0; row < h; ++row) {
+                        std::memcpy(yf->data[0] + size_t(row) * yf->linesize[0],
+                                    f.y.data() + size_t(row) * f.width,
+                                    size_t(f.width) * 2);
+                        std::memcpy(yf->data[1] + size_t(row) * yf->linesize[1],
+                                    f.cb.data() + size_t(row) * f.chromaWidth,
+                                    size_t(f.chromaWidth) * 2);
+                        std::memcpy(yf->data[2] + size_t(row) * yf->linesize[2],
+                                    f.cr.data() + size_t(row) * f.chromaWidth,
+                                    size_t(f.chromaWidth) * 2);
+                    }
+                } else {
+                    // Float path: lazy per-worker staging + sws (pinned to
+                    // BT.709 like the main context — Phase I fixed the pro
+                    // codecs' BT.601 default).
+                    if (!mySws) {
+                        rgbStg = av_frame_alloc();
+                        if (!rgbStg) throw std::runtime_error("farm: rgb alloc");
+                        rgbStg->format = AV_PIX_FMT_GBRPF32LE;
+                        rgbStg->width = w;
+                        rgbStg->height = h;
+                        if (av_frame_get_buffer(rgbStg, 0) < 0)
+                            throw std::runtime_error("farm: rgb buffer alloc");
+                        mySws = sws_getContext(
+                            w, h, AV_PIX_FMT_GBRPF32LE,
+                            w, h, static_cast<AVPixelFormat>(yf->format),
+                            SWS_BICUBIC, nullptr, nullptr, nullptr);
+                        if (!mySws) throw std::runtime_error("farm: sws alloc");
+                        const int* coeff = sws_getCoefficients(SWS_CS_ITU709);
+                        sws_setColorspaceDetails(mySws, coeff, 1, coeff, 0,
+                                                 0, 1 << 16, 1 << 16);
+                    }
+                    av_frame_make_writable(rgbStg);
+                    const float* src0 = job.rgb.data();
+                    const int gS = rgbStg->linesize[0] / int(sizeof(float));
+                    const int bS = rgbStg->linesize[1] / int(sizeof(float));
+                    const int rS = rgbStg->linesize[2] / int(sizeof(float));
+                    float* gP = reinterpret_cast<float*>(rgbStg->data[0]);
+                    float* bP = reinterpret_cast<float*>(rgbStg->data[1]);
+                    float* rP = reinterpret_cast<float*>(rgbStg->data[2]);
+                    for (int y = 0; y < h; ++y) {
+                        const float* src = src0 + size_t(y) * size_t(w) * 3;
+                        float* gRow = gP + size_t(y) * size_t(gS);
+                        float* bRow = bP + size_t(y) * size_t(bS);
+                        float* rRow = rP + size_t(y) * size_t(rS);
+                        for (int x = 0; x < w; ++x) {
+                            float r = src[x * 3 + 0];
+                            float g = src[x * 3 + 1];
+                            float b = src[x * 3 + 2];
+                            if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
+                            if (g < 0.0f) g = 0.0f; else if (g > 1.0f) g = 1.0f;
+                            if (b < 0.0f) b = 0.0f; else if (b > 1.0f) b = 1.0f;
+                            gRow[x] = g;
+                            bRow[x] = b;
+                            rRow[x] = r;
+                        }
+                    }
+                    sws_scale(mySws, rgbStg->data, rgbStg->linesize, 0, h,
+                              yf->data, yf->linesize);
+                }
+
+                yf->pts = job.idx;
+                int serr = avcodec_send_frame(ctx, yf);
+                if (serr < 0) throw std::runtime_error("farm: send_frame failed");
+                while (true) {
+                    int rec = avcodec_receive_packet(ctx, wpkt);
+                    if (rec == AVERROR(EAGAIN) || rec == AVERROR_EOF) break;
+                    if (rec < 0) throw std::runtime_error("farm: receive_packet failed");
+                    AVPacket* c = av_packet_alloc();
+                    if (!c) throw std::runtime_error("farm: packet alloc failed");
+                    av_packet_move_ref(c, wpkt);
+                    {
+                        std::lock_guard<std::mutex> lk(farm->outMtx);
+                        farm->ready.emplace(c->pts, c);
+                    }
+                    farm->outCv.notify_all();
+                }
+            }
+            // Flush this instance (delayed packets keep their frame pts and
+            // flow through the same keyed reorder map).
+            if (!farm->abortFlag.load()) {
+                avcodec_send_frame(ctx, nullptr);
+                while (true) {
+                    int rec = avcodec_receive_packet(ctx, wpkt);
+                    if (rec == AVERROR(EAGAIN) || rec == AVERROR_EOF) break;
+                    if (rec < 0) break;
+                    AVPacket* c = av_packet_alloc();
+                    if (!c) break;
+                    av_packet_move_ref(c, wpkt);
+                    {
+                        std::lock_guard<std::mutex> lk(farm->outMtx);
+                        farm->ready.emplace(c->pts, c);
+                    }
+                    farm->outCv.notify_all();
+                }
+            }
+        } catch (...) {
+            FarmSetError(std::current_exception());
+        }
+        av_packet_free(&wpkt);
+        av_frame_free(&yf);
+        if (rgbStg) av_frame_free(&rgbStg);
+        if (mySws) sws_freeContext(mySws);
+        {
+            std::lock_guard<std::mutex> lk(farm->outMtx);
+            farm->workersDone++;
+        }
+        farm->outCv.notify_all();
+    }
+
+    void FarmMuxer() {
+        int64_t next = 0;
+        try {
+            while (true) {
+                AVPacket* c = nullptr;
+                {
+                    std::unique_lock<std::mutex> lk(farm->outMtx);
+                    farm->outCv.wait(lk, [&] {
+                        return farm->abortFlag.load() ||
+                               farm->ready.count(next) != 0 ||
+                               farm->workersDone == farm->instances;
+                    });
+                    if (farm->abortFlag.load()) break;
+                    auto it = farm->ready.find(next);
+                    if (it != farm->ready.end()) {
+                        c = it->second;
+                        farm->ready.erase(it);
+                    } else {
+                        // No packet for `next` and every worker has finished
+                        // (workers only finish cleanly after the input is
+                        // closed, so `submitted` is final here).
+                        int64_t total;
+                        {
+                            std::lock_guard<std::mutex> lk2(farm->inMtx);
+                            total = farm->submitted;
+                        }
+                        if (next >= total) break;   // clean finish
+                        throw std::runtime_error(
+                            "farm: encoder produced no packet for a frame");
+                    }
+                }
+                av_packet_rescale_ts(c, videoCtx->time_base,
+                                     videoStream->time_base);
+                c->stream_index = videoStream->index;
+                int werr = av_interleaved_write_frame(fmt, c);
+                av_packet_free(&c);
+                if (werr < 0)
+                    throw std::runtime_error(
+                        "farm: av_interleaved_write_frame failed");
+                ++next;
+            }
+        } catch (...) {
+            FarmSetError(std::current_exception());
+        }
+        // Free anything stranded by an abort.
+        std::lock_guard<std::mutex> lk(farm->outMtx);
+        for (auto& kv : farm->ready) av_packet_free(&kv.second);
+        farm->ready.clear();
+    }
 };
 
 MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
@@ -305,12 +598,29 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
             s.codec == Codec::DNxHR_HQX  || s.codec == Codec::DNxHR_444 ||
             s.codec == Codec::CineForm;
         if (isProCpu) {
-            int threads = s.encoderThreads;
-            if (threads <= 0) {
-                threads = static_cast<int>(std::thread::hardware_concurrency());
-                if (threads <= 0) threads = 1;
+            int budget = s.encoderThreads;
+            if (budget <= 0) {
+                budget = static_cast<int>(std::thread::hardware_concurrency());
+                if (budget <= 0) budget = 1;
             }
-            p->videoCtx->thread_count = threads;
+            // Phase J: for ProRes, split the budget across N farm instances
+            // (slice threading plateaus ~2.5x at 12 threads; 4 instances x 3
+            // threads scales much further). encoderInstances: 0 = auto,
+            // 1 = serial/off, N = explicit (clamped to the budget).
+            int inst = 1;
+            if (proResProf >= 0 && s.encoderInstances != 1) {
+                inst = (s.encoderInstances > 1)
+                    ? std::min(s.encoderInstances, budget)
+                    : std::max(1, std::min(6, budget / 2));
+            }
+            p->farmPlannedInstances = inst;
+            // Farm instances deliberately oversubscribe threads 1.5x: slice
+            // workers stall at sync points, so extra runnable threads keep
+            // the cores fed. Measured on the 12-core dev box (4K 4444):
+            // 6x3 = 8.2 fps vs 6x2 = 7.3 vs 4x3 = 6.6 (2026-07-06 sweep).
+            p->videoCtx->thread_count = (inst > 1)
+                ? std::max(1, (budget * 3) / (2 * inst))
+                : budget;
             p->videoCtx->thread_type = (s.codec == Codec::CineForm)
                 ? (FF_THREAD_SLICE | FF_THREAD_FRAME)
                 : FF_THREAD_SLICE;
@@ -609,11 +919,65 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
 
     p->pkt = av_packet_alloc();
     if (!p->pkt) Throw("av_packet_alloc failed");
+
+    // ----- Phase J: start the ProRes encoder farm -------------------------
+    // Sibling contexts mirror videoCtx's ProRes-relevant configuration
+    // exactly (same profile, slicing, colour props, threads), so every
+    // instance produces byte-identical packets for a given frame.
+    if (p->farmPlannedInstances > 1) {
+        auto farm = std::make_unique<Impl::Farm>();
+        farm->instances = p->farmPlannedInstances;
+        farm->inCap = size_t(farm->instances) + 2;
+        farm->ctxs.push_back(p->videoCtx);
+        for (int i = 1; i < farm->instances; ++i) {
+            AVCodecContext* c = avcodec_alloc_context3(venc);
+            if (!c) Throw("avcodec_alloc_context3(farm sibling) failed");
+            c->width = s.width;
+            c->height = s.height;
+            c->time_base = p->videoCtx->time_base;
+            c->framerate = p->videoCtx->framerate;
+            c->pix_fmt = p->videoCtx->pix_fmt;
+            c->profile = p->videoCtx->profile;
+            av_opt_set(c->priv_data, "mbs_per_slice", "4", 0);
+            av_opt_set(c->priv_data, "vendor", "apl0", 0);
+            c->color_primaries = p->videoCtx->color_primaries;
+            c->color_trc = p->videoCtx->color_trc;
+            c->colorspace = p->videoCtx->colorspace;
+            c->color_range = p->videoCtx->color_range;
+            c->flags = p->videoCtx->flags;
+            c->thread_count = p->videoCtx->thread_count;
+            c->thread_type = p->videoCtx->thread_type;
+            int ferr = avcodec_open2(c, venc, nullptr);
+            if (ferr < 0) {
+                avcodec_free_context(&c);
+                ThrowAv("avcodec_open2(farm sibling)", ferr);
+            }
+            farm->ctxs.push_back(c);
+        }
+        p->farm = std::move(farm);
+        for (int wi = 0; wi < p->farm->instances; ++wi) {
+            p->farm->workers.emplace_back(
+                [impl = p.get(), wi] { impl->FarmWorker(wi); });
+        }
+        p->farm->muxer = std::thread([impl = p.get()] { impl->FarmMuxer(); });
+        fprintf(stderr,
+            "[MovEncoder] Phase J ProRes farm enabled "
+            "(%d instances x %d threads).\n",
+            p->farm->instances, p->videoCtx->thread_count);
+    }
 }
 
 MovEncoder::~MovEncoder() {
     if (!p->finalized && p->fmt) {
         try { Finalize(); } catch (...) {}
+    }
+    // Phase J: if Finalize threw (or was never reached), make sure the farm
+    // threads are joined before we start freeing what they touch.
+    if (p->farm) {
+        try { p->FarmDrain(); } catch (...) {}
+        for (size_t i = 1; i < p->farm->ctxs.size(); ++i) {
+            avcodec_free_context(&p->farm->ctxs[i]);
+        }
     }
     if (p->yuvFrame) av_frame_free(&p->yuvFrame);
     if (p->rgbStaging) av_frame_free(&p->rgbStaging);
@@ -645,6 +1009,16 @@ MovEncoder::~MovEncoder() {
 void MovEncoder::WriteVideoFrame(const float* rgb) {
     const int w = p->settings.width;
     const int h = p->settings.height;
+
+    // Phase J: with the ProRes farm active this becomes a bounded submit;
+    // a worker does the deinterleave + sws + encode off this thread.
+    if (p->farm) {
+        Impl::FarmJob job;
+        job.planar = false;
+        job.rgb.assign(rgb, rgb + size_t(w) * size_t(h) * 3);
+        p->FarmSubmit(std::move(job));
+        return;
+    }
 
     AVFrame* frameToSend = p->yuvFrame;
     int err = 0;
@@ -769,6 +1143,8 @@ send_frame:
 }
 
 void MovEncoder::WriteAudio(const int16_t* samples, int numSamplesTotal) {
+    // Phase J: all video must be encoded + muxed before audio interleaving.
+    p->FarmDrain();
     if (!p->audioCtx || numSamplesTotal <= 0) return;
 
     const int channels = p->settings.audioChannels;
@@ -848,6 +1224,12 @@ void MovEncoder::WriteAudio(const int16_t* samples, int numSamplesTotal) {
 
 void MovEncoder::Finalize() {
     if (p->finalized) return;
+
+    // Phase J: drain the farm first (workers flush every context including
+    // videoCtx, muxer writes the tail). The serial flush below then no-ops
+    // on the already-flushed videoCtx (double send_frame(NULL) is a benign
+    // EOF).
+    p->FarmDrain();
 
     if (p->videoCtx) {
         avcodec_send_frame(p->videoCtx, nullptr);
@@ -1279,6 +1661,16 @@ bool MovEncoder::PackFrameFromBayer(
 void MovEncoder::WriteVideoFrameYuv10(const PlanarYuvFrame& f) {
     if (f.width != p->settings.width || f.height != p->settings.height)
         Throw("WriteVideoFrameYuv10: frame dimensions mismatch");
+
+    // Phase J: farm submit (plane copy; the worker copies again into its
+    // own AVFrame — ~4 ms per 4K frame, dwarfed by the encode it unblocks).
+    if (p->farm) {
+        Impl::FarmJob job;
+        job.planar = true;
+        job.yuv = f;
+        p->FarmSubmit(std::move(job));
+        return;
+    }
 
     int err = av_frame_make_writable(p->yuvFrame);
     if (err < 0) ThrowAv("av_frame_make_writable(yuv10)", err);
