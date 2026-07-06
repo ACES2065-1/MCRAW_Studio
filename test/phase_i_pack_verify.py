@@ -54,6 +54,79 @@ def numpy_pack(rgb: np.ndarray, subsample422: bool):
     return y10, cb10, cr10
 
 
+def part2(clip: Path) -> None:
+    """End-to-end: GPU-packed render vs CPU-sws render, decoded plane
+    means within the Phase E.2 bar (< 1.5 cv @10-bit), identical tags."""
+    import shutil
+    import subprocess
+    import tempfile
+    FFMPEG = shutil.which("ffmpeg") or r"ffmpeg.exe"
+    FFPROBE = shutil.which("ffprobe") or r"ffprobe.exe"
+    tmp = Path(tempfile.mkdtemp(prefix="phase_i_e2e_"))
+    N = 8
+
+    def render(codec: str, gpu: bool) -> Path:
+        out = tmp / f"{codec}_{'gpu' if gpu else 'cpu'}.mov"
+        env = dict(os.environ)
+        env.pop("MCRAW_GPU_YUV", None)
+        if gpu:
+            env["MCRAW_GPU_YUV"] = "1"
+        # Subprocess so the env gate is evaluated freshly per render.
+        code = (
+            "import os, sys;"
+            f"sys.path.insert(0, r'{BUILD}');"
+            f"os.add_dll_directory(r'{VCPKG_BIN}');"
+            "import mcraw;"
+            f"mcraw.render(input=r'{clip}', output=r'{out}', "
+            f"colorspace='acescg', codec='{codec}', start=0, end={N})"
+        )
+        proc = subprocess.run([sys.executable, "-c", code], env=env,
+                              capture_output=True, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"render {codec} gpu={gpu} failed:\n{proc.stderr}")
+        if gpu and "Phase I GPU pack pipeline enabled" not in proc.stderr:
+            raise RuntimeError(
+                f"render {codec} gpu=True did not take the pack path:\n{proc.stderr}")
+        return out
+
+    def planes(path: Path, pixfmt: str, cw_div: int, w: int, h: int):
+        outp = subprocess.run(
+            [FFMPEG, "-v", "error", "-i", str(path), "-vframes", "1",
+             "-f", "rawvideo", "-pix_fmt", pixfmt, "-"],
+            capture_output=True, check=True)
+        a = np.frombuffer(outp.stdout, dtype="<u2")
+        nY = w * h
+        nC = (w // cw_div) * h
+        return a[:nY], a[nY:nY + nC], a[nY + nC:nY + 2 * nC]
+
+    def tags(path: Path) -> str:
+        outp = subprocess.run(
+            [FFPROBE, "-v", "error", "-select_streams", "v:0",
+             "-show_entries",
+             "stream=pix_fmt,color_space,color_primaries,color_transfer",
+             "-of", "csv=p=0", str(path)],
+            capture_output=True, text=True, check=True)
+        return outp.stdout.strip()
+
+    d = mcraw.Decoder(str(clip))
+    buf, h, w = d.process_frame_rgb24(d.frames[0], "srgb", False, True)
+    del buf
+
+    for codec, pixfmt, cw_div in (("prores4444", "yuv444p10le", 1),
+                                  ("dnxhr_hqx", "yuv422p10le", 2)):
+        gpu_f = render(codec, True)
+        cpu_f = render(codec, False)
+        check(f"{codec} tags equal", tags(gpu_f) == tags(cpu_f),
+              tags(gpu_f))
+        gp = planes(gpu_f, pixfmt, cw_div, w, h)
+        cp = planes(cpu_f, pixfmt, cw_div, w, h)
+        for name, gv, cv in zip(("Y", "Cb", "Cr"), gp, cp):
+            off = abs(float(gv.astype(np.float64).mean())
+                      - float(cv.astype(np.float64).mean()))
+            check(f"{codec} {name} mean offset", off < 1.5,
+                  f"{off:.3f} cv @10-bit (limit 1.5)")
+
+
 def main() -> int:
     clip = Path(sys.argv[1]) if len(sys.argv) > 1 else \
         PROJECT / "VIDEO_20250114_130136.0.mcraw"
@@ -86,6 +159,8 @@ def main() -> int:
                 frac = float((diff > 1).mean())
                 check(f"{tag} {name}", worst <= 2 and frac < 1e-4,
                       f"max|diff|={worst} cv, frac(>1)={frac:.2e}")
+
+    part2(clip)
 
     print()
     if FAILURES:

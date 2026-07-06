@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace motioncam {
 namespace video {
@@ -59,6 +60,14 @@ struct EncodeSettings {
     int colorPrimaries = 2;
     int colorTrc = 2;
     int colorMatrix = 2;
+};
+
+// Phase I (A2): one GPU-packed planar 10-bit YUV frame (values in the low
+// bits, yuv42xp10le convention), produced by PackFrameFromBayer and
+// consumed by WriteVideoFrameYuv10. Rows are tightly packed.
+struct PlanarYuvFrame {
+    std::vector<uint16_t> y, cb, cr;
+    int width = 0, height = 0, chromaWidth = 0;
 };
 
 class MovEncoder {
@@ -151,6 +160,25 @@ public:
         const float*    lsm,
         int             lsmWidth,
         int             lsmHeight);
+
+    // ----- Phase I (A2): GPU pack pipeline for the pro codecs ------------
+    //
+    // Second front-end for EnableGpuBayerPipeline: when the codec is a CPU
+    // intermediate (ProRes / DNxHR / CineForm, pix_fmt yuv42{2,4}p10le)
+    // and MCRAW_GPU_YUV=1, the same bayer chain runs on the GPU but ends
+    // in a planar 10-bit pack + readback instead of an NVENC hwframe.
+    //
+    // Producer-thread half (GPU chain + pack + readback). May run
+    // concurrently with WriteVideoFrameYuv10 on another thread, never with
+    // itself. Returns false on any CUDA error -> caller must fall back to
+    // the CPU path (ProcessFrame + WriteVideoFrame) for this and remaining
+    // frames.
+    bool PackFrameFromBayer(const uint16_t* bayer, const float wb[3],
+                            const float* lsm, int lsmWidth, int lsmHeight,
+                            PlanarYuvFrame& out);
+
+    // Consumer-thread half: copy planes into the encoder frame and encode.
+    void WriteVideoFrameYuv10(const PlanarYuvFrame& f);
 
 private:
     struct Impl;

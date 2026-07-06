@@ -704,7 +704,8 @@ static void DoRender(
             gpuBayerActive = enc.EnableGpuBayerPipeline(setup);
         }
 
-        if (gpuBayerActive) {
+        const bool gpuPackActive = gpuBayerActive && !mcv::IsNvenc(vcodec);
+        if (gpuBayerActive && !gpuPackActive) {
             // Sequential GPU bayer pipeline: decode -> upload bayer ->
             // normalise + LSM + debayer + matrix + RGB->NV12 -> NVENC.
             // CPU has almost nothing to do per frame so the producer-
@@ -736,6 +737,117 @@ static void DoRender(
                     try { progress_obj(written, total_to_render); } catch (...) {}
                 }
             }
+        } else if (gpuPackActive) {
+            // Phase I (A2): producer decodes + runs the GPU chain + packs
+            // planar YUV; consumer runs the (multithreaded) CPU encoder.
+            // Any pack failure flips permanently to the CPU float path for
+            // the remaining frames (logged once).
+            struct PackedItem {
+                bool packed = false;
+                mcv::PlanarYuvFrame yuv;     // when packed
+                std::vector<float> rgb;      // when !packed (CPU fallback)
+                uint32_t w = 0, h = 0;
+            };
+            constexpr size_t kPackQueueLimit = 2;
+            std::deque<PackedItem> queue;
+            std::mutex mtx;
+            std::condition_variable not_full, not_empty;
+            std::atomic<bool> cancel{false};
+            bool producer_done = false;
+            std::exception_ptr producer_err;
+
+            std::thread producer([&]() {
+                try {
+                    bool gpuOk = true;
+                    std::vector<uint8_t> rb = std::move(rawBuf);
+                    nlohmann::json fm;
+                    mcc::FrameParams cp = params0;
+                    int cachedIdx = s;
+                    for (int srcIdx : plan.srcIndex) {
+                        if (cancel.load()) break;
+                        if (cancel_check()) { cancel.store(true); not_empty.notify_all(); break; }
+                        if (srcIdx != cachedIdx) {
+                            decoder.loadFrame(frames[srcIdx], rb, fm);
+                            cp = mcc::BuildFrameParams(fm, containerMeta);
+                            cachedIdx = srcIdx;
+                        }
+                        PackedItem item;
+                        const uint16_t* raw = reinterpret_cast<const uint16_t*>(rb.data());
+                        if (gpuOk) {
+                            const bool useLsm = bake_vignette && !cp.lensShadingMap.empty();
+                            item.packed = enc.PackFrameFromBayer(
+                                raw, cp.asShotNeutral,
+                                useLsm ? cp.lensShadingMap.data() : nullptr,
+                                useLsm ? int(cp.lsmWidth)  : 0,
+                                useLsm ? int(cp.lsmHeight) : 0,
+                                item.yuv);
+                            if (!item.packed) {
+                                gpuOk = false;
+                                fprintf(stderr,
+                                    "[render] Phase I GPU pack failed; "
+                                    "continuing on the CPU path.\n");
+                            }
+                        }
+                        if (!item.packed) {
+                            item.w = cp.width;
+                            item.h = cp.height;
+                            mcc::ProcessFrame(raw, cp, cs, item.rgb,
+                                              highlight_recovery, bake_vignette);
+                            xform.Apply(item.rgb.data(), item.w, item.h);
+                            if (highlight_recovery && mcc::IsDisplayEncoded(cs)) {
+                                mcc::HighlightRolloff(item.rgb.data(), item.w, item.h);
+                            }
+                        }
+                        std::unique_lock<std::mutex> lk(mtx);
+                        not_full.wait(lk, [&]{ return queue.size() < kPackQueueLimit || cancel.load(); });
+                        if (cancel.load()) break;
+                        queue.push_back(std::move(item));
+                        lk.unlock();
+                        not_empty.notify_one();
+                    }
+                } catch (...) {
+                    producer_err = std::current_exception();
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mtx);
+                    producer_done = true;
+                }
+                not_empty.notify_all();
+            });
+
+            int written = 0;
+            try {
+                while (true) {
+                    std::unique_lock<std::mutex> lk(mtx);
+                    not_empty.wait(lk, [&]{ return !queue.empty() || producer_done; });
+                    if (queue.empty() && producer_done) break;
+                    PackedItem item = std::move(queue.front());
+                    queue.pop_front();
+                    lk.unlock();
+                    not_full.notify_one();
+
+                    if (item.packed) enc.WriteVideoFrameYuv10(item.yuv);
+                    else             enc.WriteVideoFrame(item.rgb.data());
+                    ++written;
+                    if (has_progress) {
+                        py::gil_scoped_acquire gil;
+                        try { progress_obj(written, total_to_render); } catch (...) {}
+                    }
+                    if (cancel_check()) {
+                        cancel.store(true);
+                        not_full.notify_all();
+                        break;
+                    }
+                }
+            } catch (...) {
+                cancel.store(true);
+                not_full.notify_all();
+                not_empty.notify_all();
+                if (producer.joinable()) producer.join();
+                throw;
+            }
+            producer.join();
+            if (producer_err) std::rethrow_exception(producer_err);
         } else {
         // Producer-consumer: producer thread runs decode + color pipeline;
         // main thread runs the encoder. Decode of frame N+1 overlaps with

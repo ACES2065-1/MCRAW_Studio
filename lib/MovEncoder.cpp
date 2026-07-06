@@ -156,6 +156,12 @@ struct MovEncoder::Impl {
     // and LSM) is passed each WriteVideoFrameFromBayer call.
     bool useGpuBayerPipeline = false;
     motioncam::cuda::BayerPipelineConstants bayerConsts{};
+
+    // Phase I (A2): GPU bayer->packed-planar pipeline for the CPU
+    // intermediate codecs (ProRes / DNxHR / CineForm). Mutually exclusive
+    // with useCudaDirectKernel (that's the NVENC hwframe path).
+    bool useGpuPackPipeline = false;
+    bool packSubsample422   = false;
 #endif
 };
 
@@ -569,11 +575,21 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
     // Pin the CPU RGB->Y'CbCr matrix to match the file's tag and the GPU
     // kernels. libswscale otherwise defaults to BT.601 coefficients, which
     // would (a) disagree with the BT.709/BT.2020 matrix we tag the file with
-    // and (b) make the CPU and GPU paths produce different YCbCr. Only the
-    // subsampled YUV deliverables go through this matrix; ProRes / DNxHR /
-    // CineForm keep libswscale's defaults. RGB input is full-range, the YUV
-    // output limited-range.
-    if (isYuvDelivery) {
+    // and (b) make the CPU and GPU paths produce different YCbCr.
+    //
+    // Phase I: the pro intermediates (ProRes / DNxHR / CineForm) are pinned
+    // too. They used to keep libswscale's BT.601 default — a latent bug of
+    // the same class E.2 fixed for MP4: the dnxhd encoder tags its stream
+    // BT.709 and NLEs assume BT.709 for HD+ ProRes, so 601-converted data
+    // decoded ~3 cv off. Pinning to BT.709 makes the data match the tag,
+    // the decoder assumption, and the Phase I GPU pack kernels.
+    // RGB input is full-range, the YUV output limited-range.
+    const bool isProYuv =
+        s.codec == Codec::ProRes422  || s.codec == Codec::ProRes422HQ ||
+        s.codec == Codec::ProRes4444 || s.codec == Codec::ProRes4444XQ ||
+        s.codec == Codec::DNxHR_HQX  || s.codec == Codec::DNxHR_444 ||
+        s.codec == Codec::CineForm;
+    if (isYuvDelivery || isProYuv) {
         const int csCoef = (effMatrix == 9) ? SWS_CS_BT2020 : SWS_CS_ITU709;
         const int* coeff = sws_getCoefficients(csCoef);
         int srcRange = 1;  // GBRPF32 RGB is full range
@@ -1019,10 +1035,23 @@ void CfaMaps(int cfaPattern, int chMap[4], int cfaToLsm[4]) {
 
 bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
 #if MCRAW_HAVE_CUDA
-    // Phase C builds on Phase B's NV12 hwframe pipeline. If Phase B isn't
-    // active for this encoder (e.g. user didn't set MCRAW_GPU_YUV, or the
-    // codec / output combo isn't supported), Phase C can't run either.
-    if (!p->useCudaDirectKernel) return false;
+    // Two GPU front-ends share this setup: the NVENC hwframe path (Phase
+    // B/C — requires useCudaDirectKernel) and the Phase I pack path for
+    // the CPU intermediate codecs (yuv42{2,4}p10le under MCRAW_GPU_YUV=1).
+    bool packMode = false;
+    if (!p->useCudaDirectKernel) {
+        const AVPixelFormat pf =
+            static_cast<AVPixelFormat>(p->yuvFrame ? p->yuvFrame->format
+                                                   : p->videoCtx->pix_fmt);
+        const bool packFmt = (pf == AV_PIX_FMT_YUV422P10LE ||
+                              pf == AV_PIX_FMT_YUV444P10LE);
+        const char* env = std::getenv("MCRAW_GPU_YUV");
+        const bool envOptIn = env && std::strcmp(env, "1") == 0;
+        if (!packFmt || !envOptIn || !motioncam::cuda::IsCudaAvailable())
+            return false;
+        packMode = true;
+        p->packSubsample422 = (pf == AV_PIX_FMT_YUV422P10LE);
+    }
 
     // Build the combined cam -> target matrix and the curve code. If the
     // target has no BakedTransform, fall back to the Phase D path: cam ->
@@ -1096,7 +1125,15 @@ bool MovEncoder::EnableGpuBayerPipeline(const GpuBayerSetup& setup) {
     C.lsm_host = nullptr;
 
     p->useGpuBayerPipeline = true;
-    if (useLut) {
+    p->useGpuPackPipeline = packMode;
+    if (packMode) {
+        fprintf(stderr,
+            "[MovEncoder] Phase I GPU pack pipeline enabled (target=%d, "
+            "%s, curve=%d%s).\n",
+            setup.targetColorSpace,
+            p->packSubsample422 ? "yuv422p10" : "yuv444p10",
+            curve, useLut ? ", 3D LUT" : "");
+    } else if (useLut) {
         fprintf(stderr,
             "[MovEncoder] Phase D bayer+LUT pipeline enabled "
             "(target=%d, OCIO '%s', %d^3 LUT).\n",
@@ -1133,6 +1170,10 @@ void MovEncoder::WriteVideoFrameFromBayer(
     if (!p->useGpuBayerPipeline) {
         Throw("WriteVideoFrameFromBayer called but Phase C bayer pipeline "
               "isn't active; caller must check HasGpuBayerPipeline() first.");
+    }
+    if (p->useGpuPackPipeline) {
+        Throw("WriteVideoFrameFromBayer called in Phase I pack mode; use "
+              "PackFrameFromBayer + WriteVideoFrameYuv10 instead.");
     }
 
     // Per-frame LSM (matches what the CPU pipeline does in Debayer.cpp).
@@ -1195,6 +1236,80 @@ void MovEncoder::WriteVideoFrameFromBayer(
     Throw("WriteVideoFrameFromBayer: this build was compiled without CUDA "
           "support; rebuild with MCRAW_ENABLE_CUDA=ON.");
 #endif
+}
+
+bool MovEncoder::PackFrameFromBayer(
+    const uint16_t* bayer, const float wb[3],
+    const float* lsm, int lsmWidth, int lsmHeight,
+    PlanarYuvFrame& out)
+{
+#if MCRAW_HAVE_CUDA
+    if (!p->useGpuPackPipeline) return false;
+
+    const int w = p->settings.width;
+    const int h = p->settings.height;
+    const int cw = p->packSubsample422 ? (w / 2) : w;
+    out.width = w;
+    out.height = h;
+    out.chromaWidth = cw;
+    out.y.resize(size_t(w) * size_t(h));
+    out.cb.resize(size_t(cw) * size_t(h));
+    out.cr.resize(size_t(cw) * size_t(h));
+
+    // Per-frame LSM, same convention as WriteVideoFrameFromBayer — but on
+    // a local copy so this producer-thread call never races the consumer.
+    motioncam::cuda::BayerPipelineConstants C = p->bayerConsts;
+    if (lsm && lsmWidth >= 2 && lsmHeight >= 2) {
+        C.lsm_w = lsmWidth;
+        C.lsm_h = lsmHeight;
+        C.lsm_host = lsm;
+    } else {
+        C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr;
+    }
+
+    return motioncam::cuda::ProcessBayerToYuvPlanarHost(
+        bayer, wb, C, p->packSubsample422,
+        out.y.data(), out.cb.data(), out.cr.data());
+#else
+    (void)bayer; (void)wb; (void)lsm; (void)lsmWidth; (void)lsmHeight; (void)out;
+    return false;
+#endif
+}
+
+void MovEncoder::WriteVideoFrameYuv10(const PlanarYuvFrame& f) {
+    if (f.width != p->settings.width || f.height != p->settings.height)
+        Throw("WriteVideoFrameYuv10: frame dimensions mismatch");
+
+    int err = av_frame_make_writable(p->yuvFrame);
+    if (err < 0) ThrowAv("av_frame_make_writable(yuv10)", err);
+
+    const int h = f.height;
+    for (int row = 0; row < h; ++row) {
+        std::memcpy(p->yuvFrame->data[0] + size_t(row) * p->yuvFrame->linesize[0],
+                    f.y.data() + size_t(row) * f.width,
+                    size_t(f.width) * 2);
+        std::memcpy(p->yuvFrame->data[1] + size_t(row) * p->yuvFrame->linesize[1],
+                    f.cb.data() + size_t(row) * f.chromaWidth,
+                    size_t(f.chromaWidth) * 2);
+        std::memcpy(p->yuvFrame->data[2] + size_t(row) * p->yuvFrame->linesize[2],
+                    f.cr.data() + size_t(row) * f.chromaWidth,
+                    size_t(f.chromaWidth) * 2);
+    }
+
+    p->yuvFrame->pts = p->videoPts++;
+    err = avcodec_send_frame(p->videoCtx, p->yuvFrame);
+    if (err < 0) ThrowAv("avcodec_send_frame(yuv10)", err);
+    while (true) {
+        int rec = avcodec_receive_packet(p->videoCtx, p->pkt);
+        if (rec == AVERROR(EAGAIN) || rec == AVERROR_EOF) break;
+        if (rec < 0) ThrowAv("avcodec_receive_packet(yuv10)", rec);
+        av_packet_rescale_ts(p->pkt, p->videoCtx->time_base,
+                             p->videoStream->time_base);
+        p->pkt->stream_index = p->videoStream->index;
+        err = av_interleaved_write_frame(p->fmt, p->pkt);
+        if (err < 0) ThrowAv("av_interleaved_write_frame(yuv10)", err);
+        av_packet_unref(p->pkt);
+    }
 }
 
 bool IsTenBitNative(Codec c) {

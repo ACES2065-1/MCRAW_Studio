@@ -9,6 +9,11 @@ RESULTS (dev box: RTX 4090, 12-core, 4032x1696, 48 frames, acescg):
     | dnxhr_hqx 2.3 | cineform 5.9  (fps)
   2026-07-06 after A1 (encoder slice threading):
     prores4444 3.1 | prores422hq 4.2 | dnxhr_hqx 9.5 | cineform 12.9  (fps)
+  2026-07-06 after A2, MCRAW_GPU_YUV=1 (GPU pack feeds the encoders):
+    prores4444 3.4 | prores422hq 4.8 | dnxhr_hqx 14.4 | cineform 27.1  (fps)
+    (env unset, CPU path: 2.9 / 4.0 / 9.2 / 12.0 — sws now pinned BT.709)
+    prores_ks remains encoder-bound; frame-parallel encoding (Approach C
+    in the spec) is the documented next step if ProRes needs more.
 
 Usage:  python test/bench_pro_codecs.py [clip.mcraw] [--frames N]
 Respects MCRAW_GPU_YUV; run it in both states when benchmarking A2.
