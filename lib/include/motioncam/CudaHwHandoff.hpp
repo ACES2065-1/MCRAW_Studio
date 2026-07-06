@@ -239,6 +239,23 @@ void UnregisterPreviewGLTexture(unsigned int gl_texture);
 // Free all interop state (registrations + the device display buffer).
 void ReleaseGlInterop();
 
+// ---------- Phase I (A2): planar 10-bit YUV pack for the pro codecs -----
+//
+// Run the render-context bayer chain, then pack BT.709 limited-range
+// 10-bit planar YUV (low-bit u16, yuv42xp10le convention) and copy the
+// planes to host. subsample422: true = 4:2:2 (chroma width w/2,
+// horizontal pair average), false = 4:4:4. Host pointers must hold h rows
+// of tightly-packed u16 (chroma rows are cw = subsample422 ? width/2 :
+// width elements). Returns false on any CUDA error.
+bool ProcessBayerToYuvPlanarHost(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& consts,
+    bool subsample422,
+    uint16_t* y_host,
+    uint16_t* cb_host,
+    uint16_t* cr_host);
+
 // Phase C.2 entry point. Same bayer pipeline as ProcessBayerToRgb but
 // instead of copying the result to host, hands the GPU RGB straight to
 // the Phase B RGB->NV12 kernel and writes the result into the caller-

@@ -98,6 +98,15 @@ struct PipelineCtx {
     int       rgbaW            = 0;
     int       rgbaH            = 0;
     bool      rgbaValid        = false;
+    // Phase I (A2): packed planar 10-bit YUV output for the pro-codec
+    // render path (render ctx only). Device planes + pinned host staging.
+    uint16_t* packY            = nullptr;
+    uint16_t* packCb           = nullptr;
+    uint16_t* packCr           = nullptr;
+    size_t    packYCount       = 0;   // elements, not bytes
+    size_t    packCCount       = 0;
+    uint16_t* pinnedPack       = nullptr;   // Y then Cb then Cr, contiguous
+    size_t    pinnedPackCount  = 0;
     // 0 = legacy default stream (render). The preview ctx lazily creates a
     // cudaStreamNonBlocking stream so it never implicitly syncs with the
     // render's default-stream work.
@@ -228,6 +237,13 @@ void ReleaseCtxLocked(PipelineCtx& ctx) {
     if (ctx.rgbaDev)     { cudaFree(ctx.rgbaDev);         ctx.rgbaDev     = nullptr;
                            ctx.rgbaBytes = 0; ctx.rgbaW = 0; ctx.rgbaH = 0;
                            ctx.rgbaValid = false; }
+    if (ctx.packY)       { cudaFree(ctx.packY);           ctx.packY       = nullptr; }
+    if (ctx.packCb)      { cudaFree(ctx.packCb);          ctx.packCb      = nullptr; }
+    if (ctx.packCr)      { cudaFree(ctx.packCr);          ctx.packCr      = nullptr; }
+    ctx.packYCount = 0;
+    ctx.packCCount = 0;
+    if (ctx.pinnedPack)  { cudaFreeHost(ctx.pinnedPack);  ctx.pinnedPack  = nullptr;
+                           ctx.pinnedPackCount = 0; }
     ReleaseDenoiseLocked(ctx);
     ctx.bufW = 0;
     ctx.bufH = 0;
@@ -1280,6 +1296,144 @@ bool ProcessBayerToRgbaDevice(
     ctx.rgbaValid = true;
     *out_w = W;
     *out_h = H;
+    return true;
+}
+
+// ============================================================================
+// Phase I (A2): float RGB -> planar 10-bit YUV for the pro-codec encoders.
+// BT.709 limited range; 10-bit value in the LOW bits (yuv42xp10le
+// convention, unlike P010's high-bit packing). Formulas match the numpy
+// reference in test/phase_i_pack_verify.py — keep them in lockstep.
+// ============================================================================
+
+__device__ __forceinline__ float3 RgbClamp01(const float* rgb, size_t i) {
+    float r = rgb[i * 3 + 0], g = rgb[i * 3 + 1], b = rgb[i * 3 + 2];
+    r = r < 0.0f ? 0.0f : (r > 1.0f ? 1.0f : r);
+    g = g < 0.0f ? 0.0f : (g > 1.0f ? 1.0f : g);
+    b = b < 0.0f ? 0.0f : (b > 1.0f ? 1.0f : b);
+    return make_float3(r, g, b);
+}
+
+__global__ void RgbFloatToYuv444P10Kernel(
+    const float* __restrict__ rgb,
+    uint16_t* __restrict__ Y, uint16_t* __restrict__ Cb,
+    uint16_t* __restrict__ Cr, int width, int height)
+{
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const size_t i = size_t(y) * size_t(width) + size_t(x);
+    const float3 c = RgbClamp01(rgb, i);
+    const float yp = 0.2126f * c.x + 0.7152f * c.y + 0.0722f * c.z;
+    const float cb = (c.z - yp) / 1.8556f;
+    const float cr = (c.x - yp) / 1.5748f;
+    Y[i]  = uint16_t(__float2int_rn(64.0f + 876.0f * yp));
+    Cb[i] = uint16_t(__float2int_rn(512.0f + 896.0f * cb));
+    Cr[i] = uint16_t(__float2int_rn(512.0f + 896.0f * cr));
+}
+
+// One thread per CHROMA sample (pixel pair). Writes two luma samples and
+// one pair-averaged Cb/Cr, matching the numpy reference's 0::2/1::2 mean.
+__global__ void RgbFloatToYuv422P10Kernel(
+    const float* __restrict__ rgb,
+    uint16_t* __restrict__ Y, uint16_t* __restrict__ Cb,
+    uint16_t* __restrict__ Cr, int width, int height)
+{
+    const int cx = blockIdx.x * blockDim.x + threadIdx.x;   // pair index
+    const int y  = blockIdx.y * blockDim.y + threadIdx.y;
+    const int cw = width / 2;
+    if (cx >= cw || y >= height) return;
+    const size_t i0 = size_t(y) * size_t(width) + size_t(cx) * 2;
+    const float3 a = RgbClamp01(rgb, i0);
+    const float3 b = RgbClamp01(rgb, i0 + 1);
+    const float ypA = 0.2126f * a.x + 0.7152f * a.y + 0.0722f * a.z;
+    const float ypB = 0.2126f * b.x + 0.7152f * b.y + 0.0722f * b.z;
+    const float cb = ((a.z - ypA) / 1.8556f + (b.z - ypB) / 1.8556f) * 0.5f;
+    const float cr = ((a.x - ypA) / 1.5748f + (b.x - ypB) / 1.5748f) * 0.5f;
+    Y[i0]     = uint16_t(__float2int_rn(64.0f + 876.0f * ypA));
+    Y[i0 + 1] = uint16_t(__float2int_rn(64.0f + 876.0f * ypB));
+    const size_t ci = size_t(y) * size_t(cw) + size_t(cx);
+    Cb[ci] = uint16_t(__float2int_rn(512.0f + 896.0f * cb));
+    Cr[ci] = uint16_t(__float2int_rn(512.0f + 896.0f * cr));
+}
+
+bool ProcessBayerToYuvPlanarHost(
+    const uint16_t* bayer_host,
+    const float wb[3],
+    const BayerPipelineConstants& C,
+    bool subsample422,
+    uint16_t* y_host,
+    uint16_t* cb_host,
+    uint16_t* cr_host)
+{
+    if (!IsCudaAvailable()) return false;
+    if (!bayer_host || !wb || !y_host || !cb_host || !cr_host) return false;
+    if (C.width <= 0 || C.height <= 0) return false;
+
+    const int W = C.width, H = C.height;
+    const int CW = subsample422 ? (W / 2) : W;
+    const size_t nY = size_t(W) * size_t(H);
+    const size_t nC = size_t(CW) * size_t(H);
+    const size_t total = nY + 2 * nC;
+
+    PipelineCtx& ctx = gRenderCtx;
+    std::lock_guard<std::mutex> lock(ctx.mtx);
+    if (!EnsureBuffers(ctx, W, H)) return false;
+    if (ctx.packYCount != nY || ctx.packCCount != nC ||
+        !ctx.packY || !ctx.packCb || !ctx.packCr) {
+        if (ctx.packY)  { cudaFree(ctx.packY);  ctx.packY  = nullptr; }
+        if (ctx.packCb) { cudaFree(ctx.packCb); ctx.packCb = nullptr; }
+        if (ctx.packCr) { cudaFree(ctx.packCr); ctx.packCr = nullptr; }
+        ctx.packYCount = 0; ctx.packCCount = 0;
+        if (cudaMalloc(reinterpret_cast<void**>(&ctx.packY),  nY * 2) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void**>(&ctx.packCb), nC * 2) != cudaSuccess ||
+            cudaMalloc(reinterpret_cast<void**>(&ctx.packCr), nC * 2) != cudaSuccess)
+            return false;
+        ctx.packYCount = nY;
+        ctx.packCCount = nC;
+    }
+    if (ctx.pinnedPackCount != total || !ctx.pinnedPack) {
+        if (ctx.pinnedPack) { cudaFreeHost(ctx.pinnedPack); ctx.pinnedPack = nullptr; }
+        ctx.pinnedPackCount = 0;
+        if (cudaMallocHost(reinterpret_cast<void**>(&ctx.pinnedPack),
+                           total * 2) == cudaSuccess)
+            ctx.pinnedPackCount = total;
+        // Pinned staging is an optimisation; on failure we copy direct.
+    }
+
+    if (!RunBayerChainLocked(ctx, bayer_host, wb, C, W, H)) return false;
+
+    dim3 block(32, 8);
+    if (subsample422) {
+        dim3 grid((CW + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+        RgbFloatToYuv422P10Kernel<<<grid, block, 0, ctx.stream>>>(
+            ctx.rgbFloat, ctx.packY, ctx.packCb, ctx.packCr, W, H);
+    } else {
+        dim3 grid((W + block.x - 1) / block.x, (H + block.y - 1) / block.y);
+        RgbFloatToYuv444P10Kernel<<<grid, block, 0, ctx.stream>>>(
+            ctx.rgbFloat, ctx.packY, ctx.packCb, ctx.packCr, W, H);
+    }
+    if (cudaGetLastError() != cudaSuccess) return false;
+
+    if (ctx.pinnedPack && ctx.pinnedPackCount == total) {
+        uint16_t* pY  = ctx.pinnedPack;
+        uint16_t* pCb = pY + nY;
+        uint16_t* pCr = pCb + nC;
+        if (cudaMemcpyAsync(pY,  ctx.packY,  nY * 2, cudaMemcpyDeviceToHost, ctx.stream) != cudaSuccess ||
+            cudaMemcpyAsync(pCb, ctx.packCb, nC * 2, cudaMemcpyDeviceToHost, ctx.stream) != cudaSuccess ||
+            cudaMemcpyAsync(pCr, ctx.packCr, nC * 2, cudaMemcpyDeviceToHost, ctx.stream) != cudaSuccess)
+            return false;
+        if (cudaStreamSynchronize(ctx.stream) != cudaSuccess) return false;
+        std::memcpy(y_host,  pY,  nY * 2);
+        std::memcpy(cb_host, pCb, nC * 2);
+        std::memcpy(cr_host, pCr, nC * 2);
+    } else {
+        if (cudaMemcpy(y_host,  ctx.packY,  nY * 2, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(cb_host, ctx.packCb, nC * 2, cudaMemcpyDeviceToHost) != cudaSuccess ||
+            cudaMemcpy(cr_host, ctx.packCr, nC * 2, cudaMemcpyDeviceToHost) != cudaSuccess)
+            return false;
+        if (cudaDeviceSynchronize() != cudaSuccess) return false;
+    }
     return true;
 }
 

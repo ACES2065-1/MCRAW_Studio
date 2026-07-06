@@ -1335,6 +1335,55 @@ encoder_threads: worker threads for ProRes/DNxHR/CineForm (0 = all cores).
         "Returns float32 (H, W, 3) RGB in the target colour space. For "
         "correctness testing against process_frame.");
 
+    // Phase I (A2) correctness binding: run the GPU chain + YUV pack on one
+    // frame; returns (Y, Cb, Cr) uint16 numpy arrays (10-bit values, low
+    // bits). For test/phase_i_pack_verify.py only.
+    m.def("cuda_pack_yuv_planar",
+        [](PyDecoder& pyDec, int64_t timestamp,
+           const std::string& target_colorspace, bool subsample422,
+           bool highlight_recovery, bool bake_vignette) -> py::tuple {
+            mc::Decoder& dec = *pyDec.underlying();
+            mcc::OutputColorSpace cs;
+            if (!mcc::ParseOutputColorSpace(target_colorspace, cs))
+                throw std::runtime_error("unknown colorspace: " + target_colorspace);
+
+            std::vector<uint8_t> rawBuf;
+            nlohmann::json frameMeta;
+            mcc::FrameParams params;
+            {
+                py::gil_scoped_release release;
+                dec.loadFrame(timestamp, rawBuf, frameMeta);
+                params = mcc::BuildFrameParams(frameMeta, dec.getContainerMetadata());
+            }
+            motioncam::cuda::BayerPipelineConstants C{};
+            if (!BuildBakedBayerConstants(params, cs, C))
+                throw std::runtime_error("target is OCIO-only; use a baked target");
+            C.highlight_recovery = highlight_recovery ? 1 : 0;
+            C.highlight_rolloff  =
+                (highlight_recovery && mcc::IsDisplayEncoded(cs)) ? 1 : 0;
+            if (!bake_vignette) { C.lsm_w = 0; C.lsm_h = 0; C.lsm_host = nullptr; }
+
+            const int W = C.width, H = C.height;
+            const int CW = subsample422 ? (W / 2) : W;
+            py::array_t<uint16_t> Y({H, W});
+            py::array_t<uint16_t> Cb({H, CW});
+            py::array_t<uint16_t> Cr({H, CW});
+            bool ok;
+            {
+                py::gil_scoped_release release;
+                const uint16_t* raw = reinterpret_cast<const uint16_t*>(rawBuf.data());
+                ok = motioncam::cuda::ProcessBayerToYuvPlanarHost(
+                    raw, params.asShotNeutral, C, subsample422,
+                    Y.mutable_data(), Cb.mutable_data(), Cr.mutable_data());
+            }
+            if (!ok) throw std::runtime_error("ProcessBayerToYuvPlanarHost failed");
+            return py::make_tuple(Y, Cb, Cr);
+        },
+        py::arg("decoder"), py::arg("timestamp"), py::arg("target_colorspace"),
+        py::arg("subsample422"), py::arg("highlight_recovery") = false,
+        py::arg("bake_vignette") = true,
+        "Phase I pack-kernel correctness probe (baked targets only).");
+
     // Phase D correctness test. Runs the GPU bayer pipeline with the OCIO
     // 3D-LUT step (normalise + debayer + cam->ACEScg matrix + asinh-shaped
     // 3D LUT) on a single frame and returns (H, W, 3) float32 in the target
