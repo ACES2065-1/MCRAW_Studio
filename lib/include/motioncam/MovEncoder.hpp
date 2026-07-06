@@ -49,6 +49,11 @@ struct EncodeSettings {
     // libx265 + tenBit needs vcpkg's x265 multilib feature; if unavailable,
     // MovEncoder falls back to 8-bit with a stderr warning.
     bool tenBit = false;
+    // Phase I (A1): worker threads for the CPU intermediate encoders
+    // (prores_ks / dnxhd / cineform). 0 = auto (all logical cores).
+    // libx264/x265 manage their own pools and NVENC is hardware — both
+    // ignore this field.
+    int encoderThreads = 0;
     // QuickTime 'nclc' / MP4 color tag (FFmpeg AVCOL_* enum values).
     // Use 2 (UNSPECIFIED) for spaces with no clean mapping (ACEScg, S-Log3, etc.).
     int colorPrimaries = 2;

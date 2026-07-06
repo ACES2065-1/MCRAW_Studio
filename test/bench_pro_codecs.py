@@ -7,6 +7,8 @@ RESULTS (dev box: RTX 4090, 12-core, 4032x1696, 48 frames, acescg):
   2026-07-05 baseline (pre Phase I):
     GPU chain 60.1 | CPU pipeline 12.0 | prores4444 1.2 | prores422hq 1.7
     | dnxhr_hqx 2.3 | cineform 5.9  (fps)
+  2026-07-06 after A1 (encoder slice threading):
+    prores4444 3.1 | prores422hq 4.2 | dnxhr_hqx 9.5 | cineform 12.9  (fps)
 
 Usage:  python test/bench_pro_codecs.py [clip.mcraw] [--frames N]
 Respects MCRAW_GPU_YUV; run it in both states when benchmarking A2.

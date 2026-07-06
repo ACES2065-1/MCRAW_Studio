@@ -20,6 +20,7 @@ extern "C" {
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 namespace motioncam {
 namespace video {
@@ -285,6 +286,29 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
     // produces ~50-100 Mbps at 4K, visually lossless on natural content.
     if (s.codec == Codec::CineForm) {
         av_opt_set(p->videoCtx->priv_data, "quality", "film3", 0);
+    }
+    // Phase I (A1): slice-thread the CPU intermediate encoders. libavcodec
+    // defaults to ONE thread unless asked. prores_ks / dnxhd parallelise
+    // across slices within a frame (bitstream identical to single-thread);
+    // cfhd additionally accepts frame threading. libx264/x265 self-thread
+    // and NVENC is hardware — neither is touched here.
+    {
+        const bool isProCpu =
+            s.codec == Codec::ProRes422  || s.codec == Codec::ProRes422HQ ||
+            s.codec == Codec::ProRes4444 || s.codec == Codec::ProRes4444XQ ||
+            s.codec == Codec::DNxHR_HQX  || s.codec == Codec::DNxHR_444 ||
+            s.codec == Codec::CineForm;
+        if (isProCpu) {
+            int threads = s.encoderThreads;
+            if (threads <= 0) {
+                threads = static_cast<int>(std::thread::hardware_concurrency());
+                if (threads <= 0) threads = 1;
+            }
+            p->videoCtx->thread_count = threads;
+            p->videoCtx->thread_type = (s.codec == Codec::CineForm)
+                ? (FF_THREAD_SLICE | FF_THREAD_FRAME)
+                : FF_THREAD_SLICE;
+        }
     }
     // Codecs with explicit user-controlled bitrate.
     if (s.codec == Codec::H264 || s.codec == Codec::H265 ||
