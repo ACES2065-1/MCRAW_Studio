@@ -9,9 +9,10 @@ RESULTS (dev box: RTX 4090, 12-core, 4032x1696, 48 frames, acescg):
     | dnxhr_hqx 2.3 | cineform 5.9  (fps)
   2026-07-06 after A1 (encoder slice threading):
     prores4444 3.1 | prores422hq 4.2 | dnxhr_hqx 9.5 | cineform 12.9  (fps)
-  2026-07-06 after A2, MCRAW_GPU_YUV=1 (GPU pack feeds the encoders):
-    prores4444 3.4 | prores422hq 4.8 | dnxhr_hqx 14.4 | cineform 27.1  (fps)
-    (env unset, CPU path: 2.9 / 4.0 / 9.2 / 12.0 — sws now pinned BT.709)
+  2026-07-06 after A2, MCRAW_GPU_YUV=1 (GPU pack feeds the encoders,
+  idle GPU + free disk — first pass ran next to a CUDA 3D app):
+    prores4444 3.2 | prores422hq 4.7 | dnxhr_hqx 15.4 | cineform 28.7  (fps)
+    (env unset, CPU path: 2.9 / 3.9 / 9.1 / 13.1 — sws now pinned BT.709)
     prores_ks remains encoder-bound; frame-parallel encoding (Approach C
     in the spec) is the documented next step if ProRes needs more.
 
@@ -71,14 +72,20 @@ def main() -> int:
         d.process_frame(t, "acescg", False, True)
     print(f"CPU pipeline (process_frame): {n/(time.perf_counter()-t0):6.1f} fps")
 
-    for codec in CODECS:
-        out = tmp / f"b_{codec}.mov"
-        t0 = time.perf_counter()
-        mcraw.render(input=str(clip), output=str(out), colorspace="acescg",
-                     codec=codec, start=0, end=n)
-        dt = time.perf_counter() - t0
-        print(f"render {codec:12s}          {n/dt:6.1f} fps  ({dt:.1f}s, "
-              f"{out.stat().st_size//1_000_000} MB)")
+    try:
+        for codec in CODECS:
+            out = tmp / f"b_{codec}.mov"
+            t0 = time.perf_counter()
+            mcraw.render(input=str(clip), output=str(out), colorspace="acescg",
+                         codec=codec, start=0, end=n)
+            dt = time.perf_counter() - t0
+            print(f"render {codec:12s}          {n/dt:6.1f} fps  ({dt:.1f}s, "
+                  f"{out.stat().st_size//1_000_000} MB)")
+    finally:
+        # ~700 MB of intermediates per pass — don't let repeat runs fill
+        # the temp drive (it has happened).
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
     return 0
 
 
