@@ -37,7 +37,7 @@ isn't code-signed yet; click *More info* → *Run anyway*.
 - **Fast professional intermediates** (v0.7) — ProRes / DNxHR / CineForm
   encoders now use every CPU core, and on NVIDIA GPUs the RAW→YUV pipeline
   runs on the GPU with only packed 10-bit planes crossing the bus. At 4K:
-  DNxHR HQX 14.4 fps (was 2.3), CineForm 27.1 (was 5.9), ProRes 4444 3.4
+  DNxHR HQX 15.4 fps (was 2.3), CineForm 28.7 (was 5.9), ProRes 4444 3.2
   (was 1.2)
 - **Outputs**:
   - **MP4** (H.264 / H.265 / AV1) — for delivery and "normal video" playback
