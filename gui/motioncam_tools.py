@@ -428,6 +428,8 @@ class RenderWorker(QtCore.QObject):
                 kwargs["denoise_luma"] = self.settings["denoise_luma"]
             if self.settings.get("ten_bit"):
                 kwargs["ten_bit"] = True
+            if "encoder_threads" in self.settings:
+                kwargs["encoder_threads"] = int(self.settings["encoder_threads"])
             if self.settings.get("highlight_recovery"):
                 kwargs["highlight_recovery"] = True
             if self.settings.get("frame_rate_conversion", 0.0) > 0.0:
@@ -2403,6 +2405,10 @@ class MainWindow(QtWidgets.QMainWindow):
             # checked state regardless of enabled state for HDR.
             if self.tenBitCheck.isChecked():
                 settings["ten_bit"] = True
+            # Phase I (A1): divide encoder threads across concurrent renders
+            # so 3 workers x 12 threads don't oversubscribe the machine.
+            settings["encoder_threads"] = max(
+                1, (os.cpu_count() or 8) // int(self.concurrentSpin.value()))
         if self.highlightRecoveryCheck.isChecked():
             settings["highlight_recovery"] = True
         # Vignette + frame-rate conversion apply to video targets (the GPU/CPU
