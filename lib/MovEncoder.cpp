@@ -581,10 +581,12 @@ MovEncoder::MovEncoder(const EncodeSettings& s) : p(std::make_unique<Impl>()) {
     } else if (s.codec == Codec::DNxHR_444) {
         av_opt_set(p->videoCtx->priv_data, "profile", "dnxhr_444", 0);
     }
-    // CineForm: pick a high-quality preset. "film3" is the highest tier;
-    // produces ~50-100 Mbps at 4K, visually lossless on natural content.
+    // CineForm: "film3+" is the top of cfhd's quality ladder (film3+ >
+    // film3 > film2+ > ... > low) and also the encoder's own default; set
+    // explicitly so the choice is visible. Pre-0.8 builds used "film3",
+    // one tier lower.
     if (s.codec == Codec::CineForm) {
-        av_opt_set(p->videoCtx->priv_data, "quality", "film3", 0);
+        av_opt_set(p->videoCtx->priv_data, "quality", "film3+", 0);
     }
     // Phase I (A1): slice-thread the CPU intermediate encoders. libavcodec
     // defaults to ONE thread unless asked. prores_ks / dnxhd parallelise

@@ -2623,7 +2623,7 @@ def _load_stylesheet() -> str:
         return ""
 
 
-APP_VERSION = "0.7.0"
+APP_VERSION = "0.8.0"
 
 # ----- External links surfaced in the menu bar -------------------------------
 DONATE_URL  = "https://afnisse-shop.fourthwall.com/products/mcraw-studio"
