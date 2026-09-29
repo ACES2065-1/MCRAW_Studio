@@ -15,7 +15,7 @@ import subprocess
 import sys
 import numpy as np
 
-FF = r"ffmpeg.exe"
+FF = "ffmpeg"
 W, H = 4032, 1696
 
 

@@ -28,7 +28,7 @@ Written offer (GPL §6 / LGPL §6 compliance):
     For at least three years from the date you received this software,
     you may obtain a copy of the corresponding source code for any GPL or
     LGPL component bundled with this software, on a physical or download
-    medium of your choice, by writing to:
+    medium of your choice, by opening an issue at:
 
         https://github.com/ACES2065-1/MCRAW_Studio/issues
 

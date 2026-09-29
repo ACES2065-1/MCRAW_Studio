@@ -6,16 +6,12 @@ name: build
 #                       Catches container-parsing / RawData / Trimmer breakage
 #                       in a couple of minutes.
 #
-#   windows-pipeline  — full CPU pipeline regression. Builds mcraw_render +
+#   windows-pipeline  — full render pipeline build. Builds mcraw_render +
 #                       the mcraw Python module against a CI-only vcpkg
-#                       manifest (.github/vcpkg/vcpkg.json), then runs
-#                       test/smoke.py and test/player_preview_verify.py
-#                       against the committed 2-frame fixture clip. NVENC
-#                       smoke cases auto-skip (no GPU on runners); GPU parity
-#                       checks in the verify script skip the same way. This
-#                       is the net that keeps Phases C–F honest: any change
-#                       to the bayer chain, color math, or encoder that
-#                       breaks a render fails this job.
+#                       manifest (.github/vcpkg/vcpkg.json), CPU-only.
+#                       No footage is committed to the repo, so render
+#                       regressions are run locally: test/smoke.py and
+#                       test/player_preview_verify.py take any .mcraw clip.
 #
 # The first pipeline run compiles FFmpeg/x265/OpenEXR/OCIO from source
 # (~60-90 min). vcpkg's binary cache is persisted via actions/cache, so
@@ -68,7 +64,7 @@ jobs:
           exit 0
 
   windows-pipeline:
-    name: Windows / CPU pipeline regression
+    name: Windows / full pipeline build
     runs-on: windows-latest
     timeout-minutes: 150
 
@@ -83,9 +79,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
-      - name: Install Python deps
-        run: python -m pip install --upgrade pip numpy
 
       - name: Prepare vcpkg binary cache dir
         run: New-Item -ItemType Directory -Force "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
@@ -112,18 +105,3 @@ jobs:
 
       - name: Build
         run: cmake --build build --config Release --parallel
-
-      - name: Install ffprobe
-        run: choco install ffmpeg -y --no-progress
-
-      - name: Pipeline smoke (render every codec, ffprobe outputs)
-        env:
-          MCRAW_BUILD_DIR: ${{ github.workspace }}\build\Release
-          MCRAW_DLL_DIR: ${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin
-        run: python test/smoke.py test/fixtures/smoke2.mcraw
-
-      - name: Player preview verification (CPU checks)
-        env:
-          MCRAW_BUILD_DIR: ${{ github.workspace }}\build\Release
-          MCRAW_DLL_DIR: ${{ github.workspace }}\build\vcpkg_installed\x64-windows\bin
-        run: python test/player_preview_verify.py test/fixtures/smoke2.mcraw

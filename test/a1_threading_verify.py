@@ -39,7 +39,7 @@ import numpy as np  # noqa: E402
 
 import mcraw  # noqa: E402
 
-FFMPEG = shutil.which("ffmpeg") or r"ffmpeg.exe"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 N = 12
 FAILURES: list[str] = []
 

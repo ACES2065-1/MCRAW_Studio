@@ -184,7 +184,7 @@ import numpy as np  # noqa: E402
 
 import mcraw  # noqa: E402
 
-FFMPEG = shutil.which("ffmpeg") or r"ffmpeg.exe"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
 N = 12
 FAILURES: list[str] = []
 
@@ -1140,8 +1140,8 @@ def part2(clip: Path) -> None:
     import shutil
     import subprocess
     import tempfile
-    FFMPEG = shutil.which("ffmpeg") or r"ffmpeg.exe"
-    FFPROBE = shutil.which("ffprobe") or r"ffprobe.exe"
+    FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+    FFPROBE = shutil.which("ffprobe") or "ffprobe"
     tmp = Path(tempfile.mkdtemp(prefix="phase_i_e2e_"))
     N = 8
 

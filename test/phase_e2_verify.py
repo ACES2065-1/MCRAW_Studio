@@ -12,8 +12,8 @@ import subprocess
 import sys
 import numpy as np
 
-FF = r"ffmpeg.exe"
-FFP = r"ffprobe.exe"
+FF = "ffmpeg"
+FFP = "ffprobe"
 W, H = 4032, 1696
 
 

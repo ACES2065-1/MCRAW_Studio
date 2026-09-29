@@ -40,8 +40,8 @@ if BUILD.is_dir() and str(BUILD) not in sys.path:
 
 import mcraw  # noqa: E402  (also validates the module loads)
 
-FFMPEG = shutil.which("ffmpeg") or r"ffmpeg.exe"
-FFPROBE = shutil.which("ffprobe") or r"ffprobe.exe"
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "ffprobe"
 N = 16
 FAILURES: list[str] = []
 
