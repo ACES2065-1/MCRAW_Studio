@@ -6,7 +6,6 @@
     "imath",
     "openexr",
     "opencolorio",
-    "pybind11",
     {
       "name": "ffmpeg",
       "default-features": true,

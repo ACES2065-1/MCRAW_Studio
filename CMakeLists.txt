@@ -205,6 +205,18 @@ if (MCRAW_BUILD_PYTHON AND MCRAW_BUILD_RENDER)
         endforeach()
     endif()
 
+    if (NOT pybind11_DIR AND NOT DEFINED CACHE{pybind11_DIR} AND Python_EXECUTABLE)
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -m pybind11 --cmakedir
+            OUTPUT_VARIABLE _pybind11_dir
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if (_pybind11_dir AND EXISTS "${_pybind11_dir}")
+            set(pybind11_DIR "${_pybind11_dir}" CACHE PATH "pybind11 CMake directory")
+        endif()
+    endif()
+
     set(PYBIND11_FINDPYTHON ON)
     find_package(pybind11 CONFIG REQUIRED)
 
