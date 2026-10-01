@@ -67,3 +67,7 @@ test_minimal*
 check_encoders.py
 motioncam_*.log
 ffmpeg_*.log
+
+# ----- Local notes / scratch docs -----
+brainstorm_features.md
+
