@@ -1,7 +1,8 @@
 # ----- Build output -----
 build/
 dist/
-dist_*/                   # any timestamped PyInstaller output dir
+# any timestamped PyInstaller output dir
+dist_*/
 *.spec.bak
 
 # ----- Compiled binaries (these are produced, never committed) -----
